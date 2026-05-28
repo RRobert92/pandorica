@@ -1,0 +1,73 @@
+# PANDORICA
+
+Analytical tools for electron microscopy.
+
+## Bundled tools
+
+- **`pandorica.stitch`** — serial-section tomogram stitcher: MT-graph-driven
+  alignment with an image-only fallback, diffeomorphism-guarded TPS warp,
+  global pose solve, CPU/GPU volume export. See
+  [`pandorica/stitch/README.md`](pandorica/stitch/README.md) for the method
+  and related-work references.
+- **`pandorica.napari`** — napari plugin: visually validate the stitcher on
+  real datasets and record coarse-alignment ground truth by hand.
+
+## Install
+
+```bash
+pip install pandorica                # core stitcher + CLI
+pip install "pandorica[napari]"      # add the napari validator widgets
+```
+
+## Use
+
+```bash
+python -m pandorica.stitch.cli <input_dir>
+```
+
+```python
+from pandorica.stitch.cli import run_stitch
+run_stitch("path/to/sections")       # writes <input_dir>/stitched_output/
+```
+
+If `tardis_em` is also installed, the same entry point is exposed as the
+`tardis_stitch` console script.
+
+## Citation
+
+If `pandorica` contributes to a publication or presentation, please cite the
+software *and* the two ZIB predecessor papers (the latter are required under
+their upstream licenses):
+
+```bibtex
+@software{kiewisz_pandorica_2026,
+  author  = {Kiewisz, Robert},
+  title   = {pandorica: analytical tools for electron microscopy},
+  year    = {2026},
+  version = {0.1.0},
+  url     = {https://github.com/RRobert92/pandorica},
+  license = {PolyForm-Noncommercial-1.0.0}
+}
+```
+
+- Lindow *et al.*, *Journal of Microscopy* (2021), SerialSectionAligner —
+  [doi:10.1111/jmi.13039](https://doi.org/10.1111/jmi.13039)
+- Weber *et al.*, *PLoS ONE* (2014), microtubulestitching
+
+See [`pandorica/stitch/README.md`](pandorica/stitch/README.md) for full author
+lists and the wider related-work list (IMOD, msemalign, Okapi-EM, …).
+
+## License
+
+**PolyForm Noncommercial License 1.0.0** — free for research, study, and use
+by educational, public-research, charitable, public-health, environmental,
+and government institutions, regardless of funding source. Commercial use
+requires a separate license; see [COMMERCIAL.md](COMMERCIAL.md) to request
+one. Full terms in [LICENSE](LICENSE).
+
+Contributions require a Developer Certificate of Origin sign-off — see
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Contact
+
+Robert Kiewisz — <robert.kiewisz@gmail.com>

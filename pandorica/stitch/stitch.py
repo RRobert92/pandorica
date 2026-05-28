@@ -1,0 +1,488 @@
+#######################################################################
+#  Serial Stitcher - An Automatic tool for tomograms stitching        #
+#                                                                     #
+#  https://github.com/RRobert92                                       #
+#                                                                     #
+#  Robert Kiewisz                                                     #
+#  PolyForm Noncommercial License 1.0.0 - see LICENSE                 #
+#######################################################################
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# Copyright (c) 2026 Robert Kiewisz
+
+"""
+Result accessors + stitched-output writer.
+
+A per-interface QC summariser for the results table, and
+:func:`export_stitched` — which applies the solved per-section poses to the
+volumes (streaming, slice-wise, via the package's :mod:`applier`) and to the
+microtubule graphs, writing a single stitched ``.am`` volume + merged
+``*_spatialGraph.am`` in the same coordinate frame.
+"""
+
+from os import makedirs
+from os.path import join
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+from scipy.ndimage import map_coordinates
+
+from pandorica.stitch.transform.solver import (
+    Pose,
+    apply_pose,
+    invert_pose,
+)
+from pandorica.stitch.transform.applier import (
+    make_inverse_map,
+    warp_volume_slicewise,
+)
+from pandorica.stitch.geometry import pose_to_pixel
+from pandorica.stitch.io import Dataset
+
+ProgressCb = Optional[Callable[[str, float], None]]
+
+
+# --------------------------------------------------------------------------- #
+# Result accessors
+# --------------------------------------------------------------------------- #
+def result_poses(result) -> List[Pose]:
+    """Absolute per-section poses from a stitch result."""
+    return list(result.poses)
+
+
+def result_warps(result) -> List:
+    """Per-interface guarded TPS warps from a stitch result (length n-1)."""
+    return [it.warp for it in result.base.interfaces]
+
+
+class _FramedWarp:
+    """
+    Adapt an interface-local guarded warp to a section's absolute output frame.
+
+    Each interface warp is fit in the **previous** section's local Å frame
+    (mapping the rigidly-aligned moving face onto the fixed reference face). To
+    apply it in the export's output frame we map a query point back through that
+    section's absolute ``frame_pose``, evaluate the base displacement, then rotate
+    the displacement (by the frame's rotation+scale) into the output frame.
+
+    ``make_inverse_map`` only needs ``.accepted`` and ``.displacement(xy)``, with
+    ``xy`` in the same units as the paired pose. ``coord_to_A`` converts those
+    working-unit coordinates to/from the Å the base warp expects (= pixel size for
+    the volume path, 1.0 for the Å graph path).
+    """
+
+    def __init__(self, base, frame_pose: Pose, coord_to_A: float = 1.0):
+        self.accepted = bool(getattr(base, "accepted", False))
+        self._base = base
+        self._inv = invert_pose(frame_pose)
+        self._rot = {
+            "Angle": frame_pose["Angle"],
+            "Tx": 0.0,
+            "Ty": 0.0,
+            "Scale": frame_pose["Scale"],
+        }
+        self._k = coord_to_A
+
+    def displacement(self, xy: np.ndarray) -> np.ndarray:
+        xy = np.asarray(xy, dtype=float)
+        local = apply_pose(self._inv, xy) * self._k  # prev-section local, Å
+        d = self._base.displacement(local)  # Å displacement
+        return apply_pose(self._rot, d) / self._k  # back to working unit
+
+
+class _SumWarp:
+    """Sum the displacements of several warps that share one (interface-local) frame.
+
+    Used to combine an interface's MT warp with its image-fill warp: both are fit
+    in the same section-k Å frame, so their residual displacements add. ``accepted``
+    is True if any constituent is.
+    """
+
+    def __init__(self, warps):
+        self._warps = [
+            w for w in warps if w is not None and getattr(w, "accepted", False)
+        ]
+        self.accepted = len(self._warps) > 0
+
+    def displacement(self, xy: np.ndarray) -> np.ndarray:
+        xy = np.asarray(xy, dtype=float)
+        d = np.zeros_like(xy)
+        for w in self._warps:
+            d = d + w.displacement(xy)
+        return d
+
+
+def interface_rows(result, dataset: Dataset) -> List[Dict]:
+    """
+    Flatten a stitch result into per-interface rows for the QC table.
+
+    Core columns come from the registration ``base``; the hybrid coarse angle/flag
+    and the intensity-verification verdict are added when available.
+    """
+    base = result.base
+    rows: List[Dict] = []
+    for k, iface in enumerate(base.interfaces):
+        row = {
+            "interface": dataset.interface_label(k),
+            "coarse_deg": iface.coarse.get("Angle", 0.0),
+            "relative_deg": iface.relative.get("Angle", 0.0),
+            "match_frac": iface.qc.match_fraction,
+            "incoherence_rho": iface.qc.shift_incoherence_rho,
+            "tangent_deg": iface.qc.tangent_discontinuity_deg,
+            "warp_ok": bool(iface.warp.accepted),
+            "qc_ok": bool(iface.qc.accepted),
+            "reasons": "; ".join(iface.qc.reasons),
+        }
+        rec = result.hybrid.records[k] if k < len(result.hybrid.records) else None
+        ang = result.hybrid.angles
+        row["hybrid_deg"] = ang[k] if k < len(ang) else float("nan")
+        row["hybrid_flag"] = bool(rec.flagged) if rec is not None else False
+        v = result.intensity[k] if k < len(result.intensity) else None
+        row["intensity_ok"] = None if v is None else bool(v.verified)
+        rows.append(row)
+    return rows
+
+
+# --------------------------------------------------------------------------- #
+# Stitched volume + microtubule export
+# --------------------------------------------------------------------------- #
+def _warp_volume_zblend(
+    volume,
+    inv_pose: Pose,
+    out_hw: Tuple[int, int],
+    out_pts: np.ndarray,
+    b_grid: np.ndarray,
+    t_grid: np.ndarray,
+    dtype=np.uint8,
+):
+    """
+    Warp a ``[Z, Y, X]`` volume with a **Z-varying** in-plane displacement.
+
+    The displacement at slice ``k`` is a linear blend of the bottom field
+    ``b_grid`` (full at the low-Z face, ``k=0``) and the top field ``t_grid``
+    (full at the high-Z face) — so each section's two faces carry their own
+    interface's half-residual and the deformation interpolates between them
+    through Z, instead of one warp applied uniformly across the section.
+
+    :param inv_pose: inverse of the section's absolute (pixel, canvas-offset) pose.
+    :param out_pts: ``[M, 2]`` output-grid ``(x, y)`` points (M = Hc*Wc).
+    :param b_grid / t_grid: ``[M, 2]`` displacements at the bottom / top face.
+    """
+    z = volume.shape[0]
+    hc, wc = out_hw
+    out = np.empty((z, hc, wc), dtype=dtype)
+    for k in range(z):
+        a = 1.0 - (k / (z - 1)) if z > 1 else 1.0  # 1 at bottom (k=0) -> 0 at top
+        disp = a * b_grid + (1.0 - a) * t_grid
+        src = apply_pose(inv_pose, out_pts - disp)  # input (x, y)
+        coords = np.vstack([src[:, 1], src[:, 0]])  # map_coordinates wants (row, col)
+        out[k] = (
+            map_coordinates(volume[k], coords, order=1, mode="constant", cval=0.0)
+            .reshape(hc, wc)
+            .astype(dtype)
+        )
+    return out
+
+
+def _corner_bbox(
+    poses_px: Sequence[Pose], h: int, w: int
+) -> Tuple[int, int, np.ndarray]:
+    """Common output canvas (Hc, Wc) and pixel offset for pixel-poses over an (h, w) frame."""
+    corners = np.array([[0, 0], [w, 0], [0, h], [w, h]], dtype=float)  # (x, y)
+    pts = np.vstack([apply_pose(p, corners) for p in poses_px])
+    mn, mx = pts.min(0), pts.max(0)
+    wc = int(np.ceil(mx[0] - mn[0]))
+    hc = int(np.ceil(mx[1] - mn[1]))
+    return hc, wc, -mn  # offset (ox, oy) maps bbox-min -> (0, 0)
+
+
+def export_stitched(
+    dataset: Dataset,
+    poses: Sequence[Pose],
+    output_dir: str,
+    downscale: int = 1,
+    progress: ProgressCb = None,
+    write_volume: bool = True,
+    warps: Optional[Sequence] = None,
+    warp_zblend: bool = False,
+    image_warps: Optional[Sequence] = None,
+    use_gpu: bool = False,
+    gpu_chunk: int = 4,
+) -> Dict[str, str]:
+    """
+    Write a stitched volume + merged microtubule graph under the solved poses.
+
+    The solved poses are physical-unit, in-plane, with section 0 the gauge anchor.
+    Volumes are warped one section at a time into a shared canvas (sized from the
+    section-0 frame transformed by every pose) and stacked along Z; microtubule
+    graphs get the same in-plane pose plus the matching canvas offset and a
+    cumulative Z shift, so volume and graph land in one coordinate frame.
+
+    :param dataset: the loaded sections (volumes are read on demand here).
+    :param poses: absolute per-section poses (length == number of sections).
+    :param output_dir: directory to create and write outputs into.
+    :param downscale: integer decimation of the volumes (and pixel size) — use >1
+        to validate the stitch on a multi-GB stack quickly.
+    :param progress: optional ``(message, fraction)`` callback for a progress bar.
+    :param write_volume: if False, only merge/export the spatial graph (fast).
+    :param warps: optional per-interface guarded warps (length ``n-1``, from
+        :func:`result_warps`). When given, section ``i`` (the moving side of
+        interface ``i-1``) additionally gets that interface's **local TPS
+        deformation** applied — to both its volume slices and its microtubules —
+        so the export reflects the fine alignment, not just the rigid poses. The
+        reference (top) face of each section is intentionally not warped, matching
+        how the warp was fit (moving→ref).
+    :param warp_zblend: **Z-varying symmetric warp** (requires ``warps``).
+        Instead of one warp applied uniformly across a section's Z, each interface
+        residual is split half/half between its two adjacent faces, which meet at
+        the mid-plane: section ``i``'s low-Z (bottom) face gets ``+½ W[i-1]`` and
+        its high-Z (top) face ``-½ W[i]``, linearly blended through Z. This
+        decouples the interfaces (warping one join no longer perturbs the next) at
+        the cost of deforming every face including the gauge. Applied to both the
+        volume slices and the microtubules. When False, the uniform warp above is
+        used.
+    :param image_warps: optional per-interface **image-fill** warps (length
+        ``n-1``, from :func:`.image_warp.image_residual_warps`) aligning the
+        MT-free regions from image content. Summed with the MT warp per interface
+        (same section-k frame) and carried through identically, including the
+        Z-blend. May be given with or without ``warps`` (latter = image-only).
+    :return: dict of written paths (``volume``, ``graph``, ``log`` as available).
+    """
+    from tardis_em.utils.export_data import to_am_streamed, NumpyToAmira
+
+    def _tick(msg: str, frac: float) -> None:
+        if progress is not None:
+            progress(msg, frac)
+
+    makedirs(output_dir, exist_ok=True)
+    n = len(dataset.sections)
+    assert n == len(poses), f"poses ({len(poses)}) must match sections ({n})"
+    log: List[str] = [
+        "TARDIS stitch-validator export",
+        f"folder:     {dataset.folder}",
+        f"sections:   {n}",
+        f"downscale:  {downscale}",
+        "",
+    ]
+    written: Dict[str, str] = {}
+
+    # -- pixel size + nominal frame from the first section that has a volume ---
+    px = 1.0
+    h = w = None
+    for s in dataset.sections:
+        if s.has_volume():
+            v0 = s.load_volume(downscale=downscale)
+            px = s.pixel_size
+            h, w = v0.shape[1], v0.shape[2]
+            s.drop_volume()
+            break
+    poses_px = [pose_to_pixel(p, px) for p in poses]
+
+    n_iface = (len(warps) if warps is not None else 0) or (
+        len(image_warps) if image_warps is not None else 0
+    )
+
+    def _iface_warp(k: int):
+        """Combined MT + image-fill warp for interface k, in section k's frame."""
+        if k < 0 or k >= n_iface:
+            return None
+        cands = []
+        if warps is not None and k < len(warps):
+            cands.append(warps[k])
+        if image_warps is not None and k < len(image_warps):
+            cands.append(image_warps[k])
+        sw = _SumWarp(cands)
+        return sw if sw.accepted else None
+
+    def _section_warp(i: int):
+        """Interface (i-1) warp for moving section i (its low-Z/bottom face)."""
+        return _iface_warp(i - 1)
+
+    def _upper_warp(i: int):
+        """Interface i warp for section i's high-Z/top face (top boundary)."""
+        return _iface_warp(i)
+
+    # ----------------------------- volume -------------------------------------
+    z_thickness = [0] * n  # slice counts (for the graph's Z stacking)
+    if write_volume and h is not None:
+        hc, wc, offset = _corner_bbox(poses_px, h, w)
+        log += [
+            f"pixel size: {px:g}",
+            f"canvas HxW: {hc} x {wc}",
+            f"offset px:  ({offset[0]:.1f}, {offset[1]:.1f})",
+            "",
+        ]
+
+        def _frame_off(j: int) -> Pose:
+            """Section j's absolute pixel pose, shifted by the canvas offset."""
+            fp = dict(poses_px[j])
+            fp["Tx"] += float(offset[0])
+            fp["Ty"] += float(offset[1])
+            return fp
+
+        out_pts = None
+        if n_iface and warp_zblend:
+            yy, xx = np.meshgrid(np.arange(hc), np.arange(wc), indexing="ij")
+            # float32: these are (Hc·Wc, 2) canvas grids — the dominant non-volume
+            # buffer — and the GPU warp casts them to float32 anyway. Canvas pixel
+            # coords are exact in float32, so no precision loss.
+            out_pts = np.column_stack([xx.ravel(), yy.ravel()]).astype(np.float32)
+
+        gpu_device = None
+        if use_gpu:
+            from pandorica.stitch import accel as _accel
+
+            gpu_device = _accel.pick_device(True)
+            log.append(f"GPU warp device: {gpu_device}")
+
+        full_z = 0
+        temp = []
+        for i, s in enumerate(dataset.sections):
+            _tick(f"warping {s.name}", i / max(n, 1))
+            if not s.has_volume():
+                log.append(f"  [{i}] {s.name}: no volume — skipped")
+                continue
+            vol = s.load_volume(downscale=downscale)
+            z_thickness[i] = vol.shape[0]
+            wb, wt = _section_warp(i), _upper_warp(i)
+            # Stream the warped section straight to a raw temp via f.write — regular
+            # file I/O goes through the OS page cache, NOT process RSS, so nothing
+            # larger than one GPU chunk is held in memory (a memmap, by contrast,
+            # keeps its pages resident). Assembled into the .am by to_am_streamed.
+            tf = join(output_dir, f"_tmp_sec{i:02d}.dat")
+            with open(tf, "wb") as fout:
+                if n_iface and warp_zblend:
+                    b_grid = (
+                        (
+                            0.5
+                            * _FramedWarp(wb, _frame_off(i - 1), px).displacement(
+                                out_pts
+                            )
+                        ).astype(np.float32)
+                        if wb is not None
+                        else np.zeros_like(out_pts)
+                    )
+                    t_grid = (
+                        (
+                            -0.5
+                            * _FramedWarp(wt, _frame_off(i), px).displacement(out_pts)
+                        ).astype(np.float32)
+                        if wt is not None
+                        else np.zeros_like(out_pts)
+                    )
+                    inv_i = invert_pose(_frame_off(i))
+                    if use_gpu and gpu_device not in (None, "cpu"):
+                        from pandorica.stitch import accel as _accel
+
+                        _accel.warp_volume_torch(
+                            vol,
+                            inv_i,
+                            (hc, wc),
+                            out_pts,
+                            b_grid,
+                            t_grid,
+                            device=gpu_device,
+                            chunk=gpu_chunk,
+                            out=fout,
+                        )
+                    else:
+                        warped = _warp_volume_zblend(
+                            vol, inv_i, (hc, wc), out_pts, b_grid, t_grid
+                        )
+                        fout.write(np.ascontiguousarray(warped).tobytes())
+                    tag = (
+                        (
+                            "  (+Zblend/GPU)"
+                            if use_gpu and gpu_device not in (None, "cpu")
+                            else "  (+Zblend)"
+                        )
+                        if (wb is not None or wt is not None)
+                        else ""
+                    )
+                else:
+                    vw = (
+                        _FramedWarp(wb, _frame_off(i - 1), px)
+                        if wb is not None
+                        else None
+                    )
+                    inv = make_inverse_map(_frame_off(i), warp=vw)
+                    warped = warp_volume_slicewise(
+                        vol, inv, out_hw=(hc, wc), dtype=np.uint8
+                    )
+                    fout.write(np.ascontiguousarray(warped).tobytes())
+                    tag = "  (+TPS)" if vw is not None else ""
+            z = vol.shape[0]
+            s.drop_volume()
+            temp.append((tf, z))
+            full_z += z
+            log.append(f"  [{i}] {s.name}: warped -> {(z, hc, wc)}{tag}")
+
+        _tick("assembling volume", 0.9)
+        vol_path = join(output_dir, "stitched_volume.am")
+        # Concatenate the raw section slabs into the .am (file -> file via
+        # copyfileobj): no full volume in RAM, no resident memmap pages.
+        to_am_streamed(vol_path, [tf for tf, _ in temp], (full_z, hc, wc), px)
+        written["volume"] = vol_path
+        log.append(f"\nstitched volume: {(full_z, hc, wc)} -> {vol_path}")
+        for tf, _ in temp:
+            try:
+                __import__("os").remove(tf)
+            except OSError:
+                pass
+    else:
+        # No volume export: still need an XY offset/px for graph placement.
+        offset = np.zeros(2)
+
+    # --------------------------- microtubules ---------------------------------
+    _tick("merging microtubules", 0.95)
+    merged = []
+    id_off = 0
+    z_off_slices = 0
+    for i, s in enumerate(dataset.sections):
+        if len(s.coords):
+            c = s.coords.copy()
+            xy = apply_pose(poses[i], c[:, 1:3])  # in-plane pose (physical, Å)
+            wb, wt = _section_warp(i), _upper_warp(i)
+            if n_iface and warp_zblend:
+                # Z-varying: +½ bottom warp at low-Z, -½ top warp at high-Z.
+                zc = c[:, 3]
+                z0, z1 = float(zc.min()), float(zc.max())
+                alpha = (1.0 - (zc - z0) / (z1 - z0)) if z1 > z0 else np.ones_like(zc)
+                b = (
+                    0.5 * _FramedWarp(wb, poses[i - 1], 1.0).displacement(xy)
+                    if wb is not None
+                    else np.zeros_like(xy)
+                )
+                t = (
+                    -0.5 * _FramedWarp(wt, poses[i], 1.0).displacement(xy)
+                    if wt is not None
+                    else np.zeros_like(xy)
+                )
+                xy = xy + alpha[:, None] * b + (1.0 - alpha)[:, None] * t
+            elif wb is not None:
+                # Uniform: same TPS deformation as the volume, non-offset Å frame.
+                xy = xy + _FramedWarp(wb, poses[i - 1], 1.0).displacement(xy)
+            c[:, 1:3] = xy
+            c[:, 1] += float(offset[0]) * px  # canvas offset (px -> Å)
+            c[:, 2] += float(offset[1]) * px
+            c[:, 3] += z_off_slices * px  # cumulative Z stack (Å)
+            c[:, 0] += id_off
+            merged.append(c)
+            id_off = int(c[:, 0].max()) + 1
+        z_off_slices += z_thickness[i]
+
+    if merged:
+        merged_arr = np.concatenate(merged, axis=0)
+        graph_path = join(output_dir, "stitched_spatialGraph.am")
+        NumpyToAmira().export_amiraV2(graph_path, merged_arr)
+        written["graph"] = graph_path
+        log.append(
+            f"merged graph: {merged_arr.shape[0]} pts / "
+            f"{int(merged_arr[:, 0].max()) + 1} MTs -> {graph_path}"
+        )
+
+    log_path = join(output_dir, "stitch_log.txt")
+    with open(log_path, "w") as f:
+        f.write("\n".join(log) + "\n")
+    written["log"] = log_path
+    _tick("done", 1.0)
+    return written

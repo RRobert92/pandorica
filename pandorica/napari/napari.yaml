@@ -1,0 +1,15 @@
+name: pandorica
+display_name: PANDORICA Serial Section Stitcher
+contributions:
+  commands:
+    - id: pandorica.stitch_validator
+      python_name: pandorica.napari._widget:StitchValidatorWidget
+      title: Serial Section Stitcher
+    - id: pandorica.coarse_gt
+      python_name: pandorica.napari._widget:CoarseGTWidget
+      title: Coarse GT Recorder
+  widgets:
+    - command: pandorica.stitch_validator
+      display_name: Serial Section Stitcher
+    - command: pandorica.coarse_gt
+      display_name: Coarse GT Recorder
