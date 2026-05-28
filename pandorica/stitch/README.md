@@ -1,3 +1,7 @@
+<p align="center">
+  <img alt="pandorica.stitch" src="../../resources/assets/pandorica-tile-512.png" width="120">
+</p>
+
 # `serial_stitch` — serial-section tomogram stitcher
 
 Automatic, no-landmark, whirlpool-safe stitching of a stack of serial-section

@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="resources/assets/pandorica-lockup-dark.png">
+    <img alt="PANDORICA" src="resources/assets/pandorica-lockup.png" width="520">
+  </picture>
+</p>
+
 # PANDORICA
 
 Analytical tools for electron microscopy.

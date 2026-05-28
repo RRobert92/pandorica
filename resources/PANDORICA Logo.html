@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PANDORICA — Logo explorations</title>
+<style>
+  @font-face {
+    font-family: "Inter";
+    src: url("fonts/Inter-VariableFont_opsz_wght.ttf") format("truetype-variations");
+    font-weight: 100 900; font-style: normal; font-display: swap;
+  }
+  html, body { margin: 0; height: 100%; font-family: "Inter", sans-serif; }
+
+  /* dark frame shared by every artboard */
+  .frame {
+    width: 100%; height: 100%;
+    background: linear-gradient(180deg, #0e1117 0%, #11161f 100%);
+    display: flex; align-items: center; justify-content: center;
+    position: relative;
+  }
+  .frame.pad { padding: 28px; box-sizing: border-box; }
+  .label {
+    position: absolute; left: 14px; bottom: 12px;
+    font-family: "Source Code Pro", monospace; font-size: 12px;
+    color: #8a96a6; letter-spacing: 0.04em;
+  }
+  /* light frame to prove the mark works on white too */
+  .frame.light { background: #f4f6f9; }
+  .frame.light .label { color: #94a3b8; }
+
+  .gh-readme {
+    width: 100%; height: 100%; box-sizing: border-box;
+    background: #0d1117; color: #e6edf3; padding: 30px 34px;
+    display: flex; flex-direction: column; gap: 16px;
+    font-family: "Inter", sans-serif;
+  }
+  .gh-readme .hr { height: 1px; background: #21262d; margin: 4px 0 2px; }
+  .gh-readme p { color: #8b949e; font-size: 14px; line-height: 1.6; margin: 0; }
+  .gh-readme .badges { display: flex; gap: 6px; margin-top: 2px; }
+  .gh-readme .badge {
+    font-family: "Source Code Pro", monospace; font-size: 11px;
+    padding: 3px 8px; border-radius: 5px; border: 1px solid #30363d; color: #8b949e;
+  }
+  .favrow { display: flex; align-items: flex-end; gap: 26px; }
+  .favrow .cell { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  .favrow .cap { font-family: "Source Code Pro", monospace; font-size: 11px; color: #8a96a6; }
+  .tile {
+    border-radius: 22%; background: linear-gradient(180deg,#0e1117,#11161f);
+    border: 1px solid rgba(255,255,255,0.08);
+    display: flex; align-items: center; justify-content: center;
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+<script type="text/babel" src="design-canvas.jsx"></script>
+<script type="text/babel" src="logo-icons.jsx"></script>
+
+<script type="text/babel">
+const { useState } = React;
+
+function Frame({ children, label, light, pad }) {
+  return (
+    <div className={"frame" + (light ? " light" : "") + (pad ? " pad" : "")}>
+      {children}
+      {label && <span className="label">{label}</span>}
+    </div>
+  );
+}
+
+const ICONS = [
+  ["A", "Section stack", IconStack, "the box, lid lifted, serial sections revealed"],
+  ["B", "Exploded volume", IconExplode, "sections fanned out of the cube"],
+  ["C", "Pandorica panels", IconPanels, "nested square panels, inner ajar"],
+  ["D", "MT graph cube", IconGraph, "cube revealing the microtubule graph"],
+  ["E", "Aperture", IconAperture, "four panels parting to a core"],
+  ["F", "Monogram P", IconMono, "P built from stacked sections"],
+];
+
+function App() {
+  return (
+    <DesignCanvas>
+      <DCSection id="icons" title="Icon explorations"
+                 subtitle="Box → opening → inner structure. Clean geometric line marks, one blue accent.">
+        {ICONS.map(([k, name, Icon, note]) => (
+          <DCArtboard key={k} id={"icon-" + k} label={k + " · " + name} width={220} height={220}>
+            <Frame label={note}><Icon size={120} /></Frame>
+          </DCArtboard>
+        ))}
+      </DCSection>
+
+      <DCSection id="lockups" title="Horizontal lockups"
+                 subtitle="Icon + wordmark + tagline — the primary repo-header form.">
+        {[["A", IconStack], ["B", IconExplode], ["C", IconPanels]].map(([k, Icon]) => (
+          <DCArtboard key={k} id={"lh-" + k} label={"Lockup · " + k} width={520} height={170}>
+            <Frame pad label={"option " + k}><LockupH Icon={Icon} /></Frame>
+          </DCArtboard>
+        ))}
+        <DCArtboard id="lh-noicon" label="Wordmark only" width={520} height={170}>
+          <Frame pad label="O swapped for the panels mark">
+            <Wordmark size={44} swapO />
+          </Frame>
+        </DCArtboard>
+      </DCSection>
+
+      <DCSection id="stacked" title="Stacked lockups & one-color"
+                 subtitle="Vertical form for square spaces; flat mono for engraving / single-color use.">
+        {[["A", IconStack], ["C", IconPanels], ["E", IconAperture]].map(([k, Icon]) => (
+          <DCArtboard key={k} id={"lv-" + k} label={"Stacked · " + k} width={260} height={260}>
+            <Frame pad><LockupV Icon={Icon} /></Frame>
+          </DCArtboard>
+        ))}
+        <DCArtboard id="mono-light" label="On light" width={260} height={260}>
+          <Frame light pad><LockupV Icon={(p) => <IconStack {...p} accent="#1f6fb2" />} /></Frame>
+        </DCArtboard>
+      </DCSection>
+
+      <DCSection id="context" title="In context"
+                 subtitle="How the chosen direction reads where it actually lives.">
+        <DCArtboard id="ctx-readme" label="GitHub README header" width={560} height="auto">
+          <div className="gh-readme">
+            <LockupH Icon={IconStack} iconSize={52} textSize={28} />
+            <div className="hr"></div>
+            <p>Analytical tools for electron microscopy — a serial-section
+               tomogram stitcher with MT-graph-driven alignment and a napari validator.</p>
+            <div className="badges">
+              <span className="badge">pip install pandorica</span>
+              <span className="badge">v0.1.0</span>
+              <span className="badge">PolyForm-NC</span>
+            </div>
+          </div>
+        </DCArtboard>
+
+        <DCArtboard id="ctx-fav" label="Favicon / avatar scaling" width={420} height="auto">
+          <Frame pad>
+            <div className="favrow">
+              {[
+                [96, 96, "96"],
+                [56, 56, "56"],
+                [32, 32, "32"],
+                [16, 16, "16"],
+              ].map(([w, ic, cap]) => (
+                <div className="cell" key={cap}>
+                  <div className="tile" style={{ width: w, height: w }}>
+                    <IconPanels size={ic * 0.78} />
+                  </div>
+                  <span className="cap">{cap}px</span>
+                </div>
+              ))}
+            </div>
+          </Frame>
+        </DCArtboard>
+      </DCSection>
+    </DesignCanvas>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>

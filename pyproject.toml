@@ -8,8 +8,90 @@
 #######################################################################
 
 [build-system]
-requires = ["setuptools>42.0", "wheel"]
+requires = ["setuptools>=67.2.0", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "pandorica"
+description = "Analytical tools for cryo-electron microscopy (stitching + napari validator)."
+readme = "README.md"
+requires-python = ">=3.10,!=3.12"
+license = { file = "LICENSE" }
+authors = [{ name = "Robert Kiewisz", email = "robert.kiewisz@gmail.com" }]
+keywords = ["cryo-em", "tomography", "stitching", "microtubules", "napari"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: Other/Proprietary License",
+    "Environment :: Console",
+    "Environment :: GPU :: NVIDIA CUDA :: 11",
+    "Natural Language :: English",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.13",
+]
+dynamic = ["version"]
+dependencies = [
+    # ML library
+    "torch>2.0.0",
+    "numpy>=2.0.0",
+    "pandas>=2.2.0",
+    # Image loading/export
+    "tifffile",
+    "imagecodecs",
+    # Image processing
+    "scikit-learn>1.0.1",
+    "scikit-image>0.19.2",
+    "scipy>=1.10.0",
+    "opencv-python>=4.12.0.0",
+    # Image registration
+    "imreg",
+    # Sibling package: pc_median_dist helper (per migration agreement)
+    "tardis_em_analysis",
+]
+
+[project.optional-dependencies]
+napari = ["napari", "qtpy"]
+
+[project.urls]
+Homepage = "https://github.com/RRobert92/pandorica"
+Repository = "https://github.com/RRobert92/pandorica"
+
+[project.entry-points."napari.manifest"]
+pandorica = "pandorica.napari:napari.yaml"
+
+[dependency-groups]
+dev = [
+    # Code testing
+    "pytest>7.0.0",
+    # PEP-8
+    "flake8>5.0.0",
+    "black>23.0.0",
+    # Build package
+    "setuptools>67.2.0",
+    "twine>=5.0.0",
+    # Plots
+    "matplotlib>3.5.2",
+    # Jupyter
+    "jupyter>=1.0.0",
+    "notebook>6.5.2",
+    # Documentation
+    "sphinx",
+    "myst_parser",
+    "pydata_sphinx_theme",
+    "sphinx_markdown_tables",
+    "sphinxcontrib-mermaid",
+    "sphinx_rtd_dark_mode",
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "pandorica._version.version" }
+
+[tool.setuptools.packages.find]
+include = ["pandorica*"]
+
+[tool.setuptools.package-data]
+"pandorica.napari" = ["napari.yaml"]
 
 [tool.isort]
 profile = "black"
@@ -18,6 +100,4 @@ lines_between_types = 1
 combine_as_imports = true
 
 [tool.pytest.ini_options]
-testpaths = [
-    "tests",
-]
+testpaths = ["tests"]
