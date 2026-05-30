@@ -13,13 +13,14 @@
 Serial-section tomogram stitcher (MT-based, with image-only fallback).
 
 This is the self-contained stitching core. The headless entry point is
-``run_stitch`` (exposed as the ``tardis_stitch`` console script in ``tardis_em``);
-the napari plugin in ``pandorica.napari`` is a thin UI that calls
-into here and can be removed without affecting the CLI.
+``run_stitch``; the napari plugin in ``pandorica.napari`` is a thin UI that
+calls into here and can be removed without affecting the CLI.
 
 Layout:
     cli           headless ``run_stitch`` orchestration + reporting
-    io            dataset discovery / loading (``Dataset``, ``load_dataset``)
+    dataset       serial-section data model (``Dataset``, ``Section``,
+                  ``load_dataset``); format-level Amira I/O lives in
+                  ``pandorica.io.amira``.
     stitch        result accessors + stitched-output export (``export_stitched``)
     image_pose    image-only coarse poses (no-MT fallback)
     image_warp    image-fill residual warps for MT-free regions

@@ -3,8 +3,7 @@
 A napari plugin to **visually validate** the serial-section stitching pipeline on
 real `.am` datasets, and to **record coarse-alignment ground truth** by hand.
 
-Runs in the **`tardis`** conda env (the only one with both napari and
-`tardis_em`).
+Runs in any conda env with napari installed.
 
 ## Two widgets
 

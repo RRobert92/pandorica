@@ -24,7 +24,7 @@ from typing import List, Optional
 
 import numpy as np
 
-from pandorica.stitch.io import Dataset
+from pandorica.stitch.dataset import Dataset
 from pandorica.stitch.transform.solver import Pose, apply_pose
 
 

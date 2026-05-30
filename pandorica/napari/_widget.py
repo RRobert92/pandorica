@@ -55,7 +55,7 @@ from qtpy.QtWidgets import (
 from pandorica.stitch import geometry as geo
 from pandorica.stitch import stitch as stitch
 from pandorica.napari import _geometry as npg
-from pandorica.stitch.io import Dataset, load_dataset
+from pandorica.stitch.dataset import Dataset, load_dataset
 from pandorica.stitch.pipeline.stitcher import stitch_sections
 
 GT_FILENAME = "coarse_gt.json"

@@ -26,7 +26,7 @@ from os.path import isdir, join, basename
 import numpy as np
 import pytest
 
-from tardis_em_analysis.utils import pc_median_dist
+from pandorica.utils.pointcloud import pc_median_dist
 
 # --------------------------------------------------------------------------- #
 # Dataset discovery
@@ -79,13 +79,12 @@ def section_graphs() -> "dict[str, np.ndarray]":
     if not _data_available():
         pytest.skip(f"dataset not found at {DATA_DIR} (set TARDIS_TEST_DATA)")
 
-    # Imported lazily so collection doesn't hard-depend on tardis_em at import time.
-    from tardis_em.utils.load_data import ImportDataFromAmira
+    from pandorica.io.amira import read_segmented_points
 
     graphs = {}
     for path in _spatial_graph_paths():
         name = basename(path).replace("_spatialGraph.am", "")
-        coords = ImportDataFromAmira(src_am=path).get_segmented_points()
+        coords = read_segmented_points(path)
         if coords is not None and len(coords) > 0:
             graphs[name] = np.asarray(coords)
     if not graphs:

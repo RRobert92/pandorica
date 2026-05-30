@@ -55,7 +55,7 @@ from pandorica.stitch.transform.applier import (
 )
 from pandorica.stitch import geometry as geo
 from pandorica.stitch.stitch import _FramedWarp
-from pandorica.stitch.io import Dataset
+from pandorica.stitch.dataset import Dataset
 from pandorica.stitch.match import block_match, block_match_ncc
 
 __all__ = [

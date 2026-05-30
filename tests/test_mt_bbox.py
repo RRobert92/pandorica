@@ -25,7 +25,7 @@ What must hold:
 
 import numpy as np
 
-from pandorica.stitch.io import Dataset, Section
+from pandorica.stitch.dataset import Dataset, Section
 from pandorica.stitch.stitch import _corner_bbox, _mt_bbox
 from pandorica.stitch.transform.solver import apply_pose
 

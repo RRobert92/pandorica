@@ -43,7 +43,7 @@ from pandorica.stitch.transform.applier import (
 )
 from pandorica.stitch import geometry as geo
 from pandorica.stitch.match import block_match, _prep, _mi, _METHODS
-from pandorica.stitch.io import Dataset
+from pandorica.stitch.dataset import Dataset
 from pandorica.stitch.contour_rotation import contour_rotation
 
 

@@ -21,8 +21,6 @@ from pandorica.stitch.cli import run_stitch
 run_stitch("path/to/sections")          # writes <dir>/stitched_output/
 ```
 
-(also exposed as the `tardis_stitch` console script in `tardis_em`).
-
 ---
 
 ## Data model and units
@@ -128,9 +126,10 @@ pipeline/        registration core, serial-section orchestrator, QC + verificati
 ## Related work
 
 `serial_stitch` is a from-scratch Python reimplementation in the serial-section
-EM lineage. Each entry below combines the citation with what `serial_stitch`
-does differently. Cite the two ZIB papers when publishing — required by their
-upstream licenses; the others are recommended for positioning context.
+EM lineage; it does not include code from any of the projects listed below.
+Each entry combines the citation with what `serial_stitch` does differently.
+Citing any of these is a scholarly courtesy for positioning context, not a
+legal obligation imposed by pandorica's license.
 
 ### Direct predecessor — SerialSectionAligner
 

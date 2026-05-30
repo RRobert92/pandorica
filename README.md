@@ -43,19 +43,25 @@ If `tardis_em` is also installed, the same entry point is exposed as the
 ## Citation
 
 If `pandorica` contributes to a publication or presentation, please cite the
-software *and* the two ZIB predecessor papers (the latter are required under
-their upstream licenses):
+software:
 
 ```bibtex
 @software{kiewisz_pandorica_2026,
   author  = {Kiewisz, Robert},
   title   = {pandorica: analytical tools for electron microscopy},
   year    = {2026},
-  version = {0.1.0},
+  version = {1.0.3},
   url     = {https://github.com/RRobert92/pandorica},
   license = {PolyForm-Noncommercial-1.0.0}
 }
 ```
+
+### Related prior work (scholarly context; not required by pandorica's license)
+
+Pandorica's stitcher is a from-scratch Python reimplementation in the
+serial-section EM lineage; it does not include code from these projects.
+Citing them is a scholarly courtesy when positioning your work, not a
+legal obligation imposed by pandorica:
 
 - Lindow *et al.*, *Journal of Microscopy* (2021), SerialSectionAligner —
   [doi:10.1111/jmi.13039](https://doi.org/10.1111/jmi.13039)

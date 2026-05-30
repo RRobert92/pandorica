@@ -1,0 +1,144 @@
+# Changelog
+
+All notable changes to pandorica are documented here.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and the project adheres to [Semantic Versioning](https://semver.org/).
+
+## [1.0.3] — 2026-05-30
+
+### Changed
+
+- **File reorganization** to separate format-level I/O and general utilities
+  from stitcher-domain code, so future pandorica tools can reuse them
+  without importing from `pandorica.stitch`:
+  - `pandorica.stitch.amira` → `pandorica.io.amira` (new package).
+    `sort_tomogram_files` joined it from `pandorica.stitch.io` because it
+    is Amira-folder discovery, not stitcher logic.
+  - `pandorica.stitch._pointcloud` → `pandorica.utils.pointcloud` (new
+    package).
+  - `pandorica.stitch.io` → `pandorica.stitch.dataset` (rename only; the
+    file is the stitcher's `Section`/`Dataset` data model, not general
+    I/O — the old name was misleading).
+- No public-API signature changes; only import paths moved. Downstream
+  callers update their imports:
+
+  | Was | Becomes |
+  | --- | --- |
+  | `from pandorica.stitch.amira import …` | `from pandorica.io.amira import …` |
+  | `from pandorica.stitch._pointcloud import pc_median_dist` | `from pandorica.utils.pointcloud import pc_median_dist` |
+  | `from pandorica.stitch.io import Dataset, load_dataset, Section` | `from pandorica.stitch.dataset import Dataset, load_dataset, Section` |
+  | `from pandorica.stitch.io import sort_tomogram_files` | `from pandorica.io.amira import sort_tomogram_files` |
+
+## [1.0.2] — 2026-05-30
+
+### Added
+
+- **Native AmiraMesh I/O** at `pandorica.stitch.amira`:
+  `read_spatial_graph`, `read_segmented_points`, `read_amira_volume`,
+  `write_spatial_graph`, `write_amira_volume_streamed`, plus a
+  `SpatialGraph` dataclass for lossless round-trip. Supports ASCII and
+  binary spatial graphs (read **and** write) with arbitrary per-vertex /
+  per-edge / per-point int and float label/scalar fields. Validated
+  bit-equal against the previous `tardis_em` readers on Monopoles_test
+  and C.elegans_FemalePN, and against the previous `tardis_em` writers
+  for V2-schema synthesis.
+- **`pc_median_dist`** ported into `pandorica.stitch._pointcloud`.
+  Bit-equal on the `avg_over=False` path (the only path the stitcher
+  exercises).
+- **`pandorica` console script** with rich-styled terminal UI:
+  `pandorica stitch ...` is a click subcommand whose flags are
+  auto-derived from `inspect.signature(pandorica.stitch.cli.run_stitch)`
+  and whose help text is pulled from the function's docstring. Adding a
+  kwarg to `run_stitch` makes a new flag appear in `pandorica stitch
+  --help` with no changes to the CLI code. Rendering covers startup
+  banner panel, cyan section rules, in-stream `ok`/`FAIL` colouring,
+  yellow warning panel for the image-only branch, red error panel for
+  cannot-stitch failures, and a green summary panel with output paths
+  and elapsed time.
+- **Saved log header** (`stitch_log.txt` next to the stitched volume)
+  now includes pandorica version, run date, project URL, license, the
+  full BibTeX citation, and every reproducible kwarg (15 fields in the
+  Settings block — input/output dirs, downscale, all warp/GPU/coarse/MT
+  flags, workers). Header content is identical whether invoked via
+  `pandorica stitch`, `tardis_stitch`, or `run_stitch` from a script.
+
+### Changed
+
+- ASCII float emission in `write_spatial_graph` upgraded to `%.17e`
+  (IEEE-754 round-trip-safe for float64) — fixes a 1-ULP drift on
+  ~0.6 % of values that `%.15e` could not round-trip.
+- ASCII spatial-graph parser now reads float fields directly into
+  float64 (was: dropped through float32 and lost ~7 decimal digits
+  before upcasting). Vertex and point coordinates are returned as
+  float64 regardless of source dtype.
+- `Section.load_volume` no longer triggers a wasted spatial-graph parse
+  as a side-effect of loading the image volume.
+- Citation guidance softened in `README.md` and `pandorica/stitch
+  /README.md`: removed the inaccurate claim that prior-work citations
+  (Lindow 2021 / Weber 2014) are required by upstream licenses.
+  Pandorica is a from-scratch reimplementation that does not include
+  code from those projects; those citations are scholarly courtesy for
+  positioning context, not a legal obligation imposed by pandorica.
+- BibTeX `version` field in `README.md` updated to match the package
+  version.
+
+### Removed
+
+- Runtime dependencies on `tardis_em` and `tardis_em_analysis`. Replaced
+  module-for-module:
+  - `tardis_em.utils.load_data.ImportDataFromAmira` →
+    `pandorica.stitch.amira.read_segmented_points` and
+    `pandorica.stitch.amira.read_amira_volume`.
+  - `tardis_em.utils.export_data.to_am_streamed` →
+    `pandorica.stitch.amira.write_amira_volume_streamed`.
+  - `tardis_em.utils.export_data.NumpyToAmira.export_amiraV2` →
+    `pandorica.stitch.amira.write_spatial_graph`.
+  - `tardis_em_analysis.utils.pc_median_dist` →
+    `pandorica.stitch._pointcloud.pc_median_dist`.
+- User-facing strings that enumerated `tardis_em` / `tardis_stitch` as a
+  consumer of pandorica (a downstream wrapper detail leaking into
+  upstream docs). Removed from `pandorica/stitch/__init__.py`,
+  `pandorica/stitch/stitch.py` log header, `pandorica/stitch/README.md`,
+  and `pandorica/napari/README.md`.
+- Stale `requires_tardis_em` skipif markers from
+  `tests/test_napari_stitch.py` (their guarded tests no longer depend
+  on `tardis_em`).
+
+### Dependencies
+
+- Added `click >= 8.0`, `rich >= 13.0`, `docstring_parser >= 0.15` for
+  the new `pandorica` CLI.
+
+### Companion change (in `tardis_em`)
+
+- The `tardis_stitch` console-script wrapper in `tardis_em` was rewritten
+  to derive its flag set from `inspect.signature(run_stitch)` at import
+  time. Adding a kwarg in pandorica's `run_stitch` now surfaces in
+  `tardis_stitch --help` after a `pip install -U pandorica` — no
+  `tardis_em` release required. (Change lives in the `tardis_em` repo;
+  it depends on pandorica via the `[stitch]` extra with `docstring_parser`
+  added.)
+
+## [1.0.0] — 2026-05-30
+
+### Added
+
+- GPU chunk auto-sizing (`gpu_chunk=None` → sizes from free CUDA VRAM,
+  clamped to `[1, 64]` slices; falls back to 4 on MPS).
+- Coarse warp displacement grid (`warp_coarse_px=8`) with bilinear
+  upsample, replacing per-pixel scipy `RBFInterpolator` evaluation —
+  ~21× faster on the export path, sub-pixel error.
+- `trim_to_mts` option (with `mt_pad_frac` padding) to size the export
+  canvas to the microtubule bounding box instead of the section corner
+  bbox.
+
+### Changed
+
+- Project migrated to PEP-621 `pyproject.toml` layout; assets added.
+
+## [Initial commit] — 2026-05-28
+
+- Forked out of `tardis_em_analysis.serial_stitch` to relicense under
+  PolyForm Noncommercial 1.0.0. Same author, same algorithmic
+  pipeline; rename only.

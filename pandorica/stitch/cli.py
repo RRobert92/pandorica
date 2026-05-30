@@ -34,7 +34,7 @@ try:
 except Exception:  # noqa: BLE001
     _VERSION = "?"
 
-from pandorica.stitch.io import load_dataset
+from pandorica.stitch.dataset import load_dataset
 from pandorica.stitch import stitch as stitch
 from pandorica.stitch import image_warp as imgwarp
 from pandorica.stitch import accel as accel
@@ -42,6 +42,56 @@ from pandorica.stitch.pipeline.stitcher import (
     stitch_sections,
     _INTENSITY_MIN_ANGLE_DEG,
 )
+
+
+_BANNER_BORDER = "#" * 71
+
+
+def _report_header(pandorica_version: str) -> list[str]:
+    """Build the citation / provenance preamble that opens every saved log.
+
+    The block is emitted verbatim through the log callback (so callers — the
+    pandorica CLI, the tardis_stitch CLI, custom scripts — all see the same
+    text in their terminal) and is also the first thing written into
+    ``stitch_log.txt`` next to the stitched volume. The text covers three
+    points a reader needs to reproduce or attribute a run:
+
+        1. Tool name + version (what produced this output).
+        2. Project URL + license (where to verify / how it may be used).
+        3. BibTeX entry for the software (academic citation for pandorica).
+
+    Followed by the runtime ``Settings`` block, the file is self-contained:
+    given the log + the named pandorica version, the run can be reproduced.
+
+    Note: prior-work references for the stitching method live in the source
+    (where the algorithms are documented), not here — pandorica's method is
+    an independent reimplementation and does not borrow code from upstream,
+    so no third-party citation is required of users of this output.
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return [
+        _BANNER_BORDER,
+        "#  PANDORICA  —  serial-section tomogram stitcher",
+        f"#  Version : pandorica v{pandorica_version}",
+        f"#  Date    : {now}",
+        "#  Project : https://github.com/RRobert92/pandorica",
+        "#  License : PolyForm Noncommercial 1.0.0",
+        _BANNER_BORDER,
+        "#",
+        "#  Please cite pandorica if it contributes to a publication:",
+        "#",
+        "#    @software{kiewisz_pandorica_2026,",
+        "#      author  = {Kiewisz, Robert},",
+        "#      title   = {pandorica: analytical tools for electron microscopy},",
+        "#      year    = {2026},",
+        f"#      version = {{v{pandorica_version}}},",
+        "#      url     = {https://github.com/RRobert92/pandorica},",
+        "#      license = {PolyForm-Noncommercial-1.0.0}",
+        "#    }",
+        "#",
+        _BANNER_BORDER,
+        "",
+    ]
 
 
 def _fmt_pose(p):
@@ -142,25 +192,22 @@ def run_stitch(
     device = "cpu" if use_gpu is False else accel.pick_device(True)
     gpu_on = device != "cpu"
 
-    report = [
-        "#" * 71,
-        "#  PANDORICA serial-section stitcher",
-        f"#  pandorica v{_VERSION}   {datetime.now():%Y-%m-%d %H:%M:%S}",
-        "#" * 71,
-        "",
-        "--- Settings ---",
-        f"input_dir   : {input_dir}",
-        f"output_dir  : {out}",
-        f"downscale   : {downscale}",
-        f"coarse      : {'CPD multi-seed' if cpd_coarse else 'gated sweep'}",
-        f"warp_omega  : {warp_omega}  (vorticity bound)",
-        f"z-blend     : {zblend}",
-        f"image_fill  : {image_fill}  (metric={method})",
-        f"GPU warp    : {gpu_on}  (device={device})",
-        f"GPU chunk   : {'auto (sized from free VRAM)' if gpu_chunk is None else f'{gpu_chunk} slices (manual)'}",
-        f"warp coarse : {warp_coarse_px} px  ({'full eval' if warp_coarse_px <= 0 else 'coarse + bilinear upsample'})",
-        f"trim to MTs : {trim_to_mts}  (pad={mt_pad_frac:.0%})" if trim_to_mts else f"trim to MTs : {trim_to_mts}",
-        f"match workers: {workers}",
+    report = _report_header(_VERSION) + [
+        "--- Settings (full kwargs for reproduction) ---",
+        f"input_dir      : {input_dir}",
+        f"output_dir     : {out}",
+        f"downscale      : {downscale}",
+        f"image_fill     : {image_fill}",
+        f"method         : {method}",
+        f"warp_omega     : {warp_omega}",
+        f"zblend         : {zblend}",
+        f"cpd_coarse     : {cpd_coarse}",
+        f"use_gpu        : {use_gpu}   (resolved device: {device})",
+        f"gpu_chunk      : {gpu_chunk}   ({'auto (sized from free VRAM)' if gpu_chunk is None else 'manual'})",
+        f"warp_coarse_px : {warp_coarse_px}",
+        f"trim_to_mts    : {trim_to_mts}",
+        f"mt_pad_frac    : {mt_pad_frac}",
+        f"workers        : {workers}",
         "",
     ]
     for line in report:

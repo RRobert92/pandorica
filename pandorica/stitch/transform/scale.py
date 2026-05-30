@@ -30,7 +30,7 @@ from typing import List, Dict
 
 import numpy as np
 
-from tardis_em_analysis.utils import pc_median_dist
+from pandorica.utils.pointcloud import pc_median_dist
 from pandorica.stitch.matching.mt_endpoints import (
     extract_boundary_endpoints,
 )

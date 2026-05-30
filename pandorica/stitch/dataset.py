@@ -10,22 +10,26 @@
 # Copyright (c) 2026 Robert Kiewisz
 
 """
-Dataset discovery + lazy loading for the stitch-validator plugin.
+Serial-section dataset model for the stitcher.
 
-A *dataset* is a folder of serial sections, each with an Amira image ``.am`` and a
-matching ``*_spatialGraph.am`` (microtubules), discovered/paired by the package's
-own :func:`sort_tomogram_files`. Spatial graphs are small and loaded eagerly;
-volumes are multi-GB and loaded **only on demand** (and may be downsampled for
-display), so opening a dataset never pulls a gigabyte into RAM.
+A *dataset* is a folder of serial sections, each with an Amira image ``.am``
+and a matching ``*_spatialGraph.am`` (microtubules). Format-level discovery
+and pairing live in :mod:`pandorica.io.amira`
+(:func:`pandorica.io.amira.sort_tomogram_files`); this module wraps the
+discovered pairs into the stitcher-domain :class:`Section` / :class:`Dataset`
+data model, eagerly loading the small spatial graphs and leaving the
+multi-GB volumes lazy.
 """
 
 import re
 from dataclasses import dataclass, field
 from os import listdir
-from os.path import basename, commonprefix, isdir, isfile, join, split, splitext
+from os.path import basename, commonprefix, isdir, isfile, join, splitext
 from typing import List, Optional, Tuple
 
 import numpy as np
+
+from pandorica.io.amira import sort_tomogram_files
 
 # Shown when a folder has files but none can be paired into stitchable sections.
 # Kept short (≤ a few lines) so it renders cleanly inside the PANDORICA log header.
@@ -58,75 +62,6 @@ def _raise_no_sections(folder: str, load_errors: Optional[List[str]] = None) -> 
     lines.append("")
     lines.append(_EXPECTED_LAYOUT)
     raise FileNotFoundError("\n".join(lines))
-
-
-def sort_tomogram_files(path):
-    image_exts = {".tif", ".tiff", ".mrc", ".rec", ".am"}
-    coord_exts = {".csv", ".am"}
-
-    images = []
-    coordinates = []
-
-    for fname in listdir(path):
-        fpath = join(path, fname)
-        if not isfile(fpath):
-            continue
-
-        ext = splitext(fname)[1].lower()
-
-        # Normal image types (non-.am)
-        if ext in image_exts and ext != ".am":
-            images.append(fpath)
-            continue
-
-        # Normal coordinate types (non-.am)
-        if ext in coord_exts and ext != ".am":
-            coordinates.append(fpath)
-            continue
-
-        # Handle .am files (Amira/Avizo) → classify by header CONTENT, not by the
-        # exact format string. Both image volumes and microtubule spatial graphs
-        # are "AmiraMesh"/"Avizo" files and the format line varies
-        # ("AmiraMesh" vs "Avizo", BINARY vs ASCII, 2.x vs 3.x), so sniff what the
-        # file *defines*: a uniform ``Lattice`` (image volume) vs
-        # ``VERTEX``/``EDGE``/``HxSpatialGraph`` (the MT graph).
-        if ext == ".am":
-            try:
-                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                    head = f.read(8192).lower()
-            except OSError:
-                continue  # skip unreadable files
-
-            is_graph = (
-                "hxspatialgraph" in head
-                or "define vertex" in head
-                or "define edge" in head
-            )
-            if "define lattice" in head and not is_graph:
-                images.append(fpath)
-            else:
-                coordinates.append(fpath)
-
-    # Graph-only folder (no detectable image volumes): still return the graphs so
-    # the caller can build volume-free sections.
-    if not images:
-        return [], sorted(coordinates)
-
-    # Pair each image with the coord file whose name contains the image stem.
-    img_path_list, coord_path_list = [], []
-    for img in sorted(images):
-        img_path_list.append(img)
-
-        img = splitext(split(img)[-1])[0].lower()
-
-        matches = [p for p in coordinates if img in splitext(split(p)[-1])[0].lower()]
-
-        if len(matches) == 0:
-            coord_path_list.append(None)
-        else:
-            coord_path_list.append(matches[0])
-
-    return img_path_list, coord_path_list
 
 
 def _stem(path: Optional[str], index: int) -> str:
@@ -207,12 +142,9 @@ class Section:
         if self._volume is not None and not force:
             return self._volume
 
-        from tardis_em.utils.load_data import ImportDataFromAmira
+        from pandorica.io.amira import read_amira_volume
 
-        am = ImportDataFromAmira(
-            src_am=self.coord_path or self.image_path, src_img=self.image_path
-        )
-        vol, px = am.get_image()
+        vol, px, _physical_size, _transformation = read_amira_volume(self.image_path)
         vol = np.asarray(vol)
         if downscale > 1:
             vol = vol[::downscale, ::downscale, ::downscale]
@@ -250,7 +182,7 @@ def load_dataset(folder: str) -> Dataset:
     """
     Discover and load a serial-section dataset folder.
 
-    Graphs are read eagerly (``ImportDataFromAmira.get_segmented_points``);
+    Graphs are read eagerly via :func:`pandorica.io.amira.read_segmented_points`;
     volumes are left unloaded. Sections without a graph get an empty ``[0, 4]``
     coords array so they still appear in the stack (volume-only stitching is still
     possible, but the MT pipelines need graphs).
@@ -258,7 +190,7 @@ def load_dataset(folder: str) -> Dataset:
     :param folder: directory containing ``.am`` images and ``*_spatialGraph.am``.
     :return: a :class:`Dataset` in stack order.
     """
-    from tardis_em.utils.load_data import ImportDataFromAmira
+    from pandorica.io.amira import read_segmented_points
 
     image_paths, coord_paths = sort_tomogram_files(folder)
     if not image_paths and not coord_paths:
@@ -281,7 +213,7 @@ def load_dataset(folder: str) -> Dataset:
         coords = np.empty((0, 4))
         if coord is not None and coord.endswith(".am"):
             try:
-                c = ImportDataFromAmira(src_am=coord).get_segmented_points()
+                c = read_segmented_points(coord)
             except Exception as e:  # noqa: BLE001 — malformed / misclassified .am
                 load_errors.append(f"{basename(coord)}: {e}")
                 c = None

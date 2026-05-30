@@ -36,7 +36,7 @@ from pandorica.stitch.transform.applier import (
     warp_volume_slicewise,
 )
 from pandorica.stitch.geometry import pose_to_pixel
-from pandorica.stitch.io import Dataset
+from pandorica.stitch.dataset import Dataset
 
 ProgressCb = Optional[Callable[[str, float], None]]
 
@@ -369,7 +369,10 @@ def export_stitched(
         ``trim_to_mts=True``. ``0.05`` = 5 % context on each side.
     :return: dict of written paths (``volume``, ``graph``, ``log`` as available).
     """
-    from tardis_em.utils.export_data import to_am_streamed, NumpyToAmira
+    from pandorica.io.amira import (
+        write_amira_volume_streamed,
+        write_spatial_graph,
+    )
 
     def _tick(msg: str, frac: float) -> None:
         if progress is not None:
@@ -384,7 +387,6 @@ def export_stitched(
         _PV = "?"
     log: List[str] = [
         f"PANDORICA serial-section stitch export  (pandorica v{_PV})",
-        "  (also reachable via the tardis_stitch console script when tardis_em is installed)",
         f"folder:     {dataset.folder}",
         f"sections:   {n}",
         f"downscale:  {downscale}",
@@ -594,7 +596,9 @@ def export_stitched(
         vol_path = join(output_dir, "stitched_volume.am")
         # Concatenate the raw section slabs into the .am (file -> file via
         # copyfileobj): no full volume in RAM, no resident memmap pages.
-        to_am_streamed(vol_path, [tf for tf, _ in temp], (full_z, hc, wc), px)
+        write_amira_volume_streamed(
+            vol_path, [tf for tf, _ in temp], (full_z, hc, wc), px
+        )
         written["volume"] = vol_path
         log.append(f"\nstitched volume: {(full_z, hc, wc)} -> {vol_path}")
         for tf, _ in temp:
@@ -647,7 +651,7 @@ def export_stitched(
     if merged:
         merged_arr = np.concatenate(merged, axis=0)
         graph_path = join(output_dir, "stitched_spatialGraph.am")
-        NumpyToAmira().export_amiraV2(graph_path, merged_arr)
+        write_spatial_graph(graph_path, merged_arr)
         written["graph"] = graph_path
         log.append(
             f"merged graph: {merged_arr.shape[0]} pts / "

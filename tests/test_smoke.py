@@ -20,8 +20,8 @@ import pytest
 
 def test_package_imports():
     """The package and its core reusables import cleanly."""
-    import tardis_em_analysis  # noqa: F401
-    from tardis_em_analysis.utils import pc_median_dist  # noqa: F401
+    import pandorica.io.amira  # noqa: F401
+    from pandorica.utils.pointcloud import pc_median_dist  # noqa: F401
     from pandorica.stitch.matching.mt_endpoints import (  # noqa: F401
         extract_boundary_endpoints,
     )

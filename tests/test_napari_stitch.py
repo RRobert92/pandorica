@@ -18,22 +18,14 @@ export (warp canvas sizing, Z-stacking, graph merge). Widget wiring itself needs
 a live napari Viewer (OpenGL) and is exercised manually / offscreen elsewhere.
 """
 
-import importlib.util
 import os
 
 import numpy as np
 import pytest
 
-# Volume export delegates to tardis_em's Amira writers, an optional peer that is
-# not installed on CI. Skip the export-path tests when it is unavailable.
-_HAS_TARDIS_EM = importlib.util.find_spec("tardis_em") is not None
-requires_tardis_em = pytest.mark.skipif(
-    not _HAS_TARDIS_EM, reason="tardis_em not installed"
-)
-
 from pandorica.stitch import geometry as geo
 from pandorica.napari import _geometry as npg
-from pandorica.stitch import io as io
+from pandorica.stitch import dataset as io
 from pandorica.stitch import stitch as st
 from pandorica.stitch.pipeline.stitcher import stitch_sections
 from pandorica.stitch import image_warp as iw
@@ -140,7 +132,6 @@ def _mem_section(name, i, vol, px, coords):
     return s
 
 
-@requires_tardis_em
 def test_export_stitched_volume_and_graph(tmp_path, monkeypatch):
     # keep preset in-memory volumes alive (export drops + would otherwise reload)
     monkeypatch.setattr(io.Section, "drop_volume", lambda self: None)
@@ -200,7 +191,6 @@ def test_framed_warp_coord_to_A_scaling():
     assert np.allclose(fw.displacement(np.zeros((1, 2))), [[2.0, 2.0]])
 
 
-@requires_tardis_em
 def test_export_warp_changes_volume(tmp_path, monkeypatch):
     monkeypatch.setattr(io.Section, "drop_volume", lambda self: None)
     vol = np.zeros((4, 30, 40), np.uint8)
@@ -273,7 +263,6 @@ def test_gpu_warp_matches_cpu_zblend():
     assert np.mean(np.abs(cpu.astype(int) - gpu.astype(int))) < 2.0
 
 
-@requires_tardis_em
 def test_export_zblend_differs_from_uniform(tmp_path, monkeypatch):
     monkeypatch.setattr(io.Section, "drop_volume", lambda self: None)
     vol = np.zeros((4, 30, 40), np.uint8)
@@ -338,7 +327,6 @@ def test_sum_warp_adds_displacements():
     assert not st._SumWarp([]).accepted
 
 
-@requires_tardis_em
 def test_export_graph_only(tmp_path):
     c = np.array([[0, 1.0, 2.0, 0.0], [0, 5.0, 6.0, 1.0]])
     ds = io.Dataset(
