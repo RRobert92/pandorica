@@ -89,6 +89,9 @@ dev = [
     "sphinxcontrib-mermaid",
     "sphinx_rtd_dark_mode",
 ]
+napari = [
+    "napari[all]>=0.7.0",
+]
 
 [tool.setuptools.dynamic]
 version = { attr = "pandorica._version.version" }

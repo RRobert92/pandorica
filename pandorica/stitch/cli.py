@@ -44,7 +44,19 @@ from pandorica.stitch.pipeline.stitcher import (
 )
 
 
-_BANNER_BORDER = "#" * 71
+_BANNER_WIDTH = 75  # total chars per header line (sized for the BibTeX block)
+_BANNER_BORDER = "#" * _BANNER_WIDTH
+
+
+def _h(text: str = "") -> str:
+    """Format one interior banner line as ``"# <text> #"`` padded to width.
+
+    Picked so every line in the citation block is a fully-closed box rather
+    than an open-right comment ruler — the previous ``"#  ..."`` lines had
+    a top/bottom border but no closing column.
+    """
+    inner = _BANNER_WIDTH - 4  # 2 chars ("# ") on left + 2 chars (" #") on right
+    return f"# {text:<{inner}} #"
 
 
 def _report_header(pandorica_version: str) -> list[str]:
@@ -71,24 +83,24 @@ def _report_header(pandorica_version: str) -> list[str]:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return [
         _BANNER_BORDER,
-        "#  PANDORICA  —  serial-section tomogram stitcher",
-        f"#  Version : pandorica v{pandorica_version}",
-        f"#  Date    : {now}",
-        "#  Project : https://github.com/RRobert92/pandorica",
-        "#  License : PolyForm Noncommercial 1.0.0",
+        _h(" PANDORICA  —  serial-section tomogram stitcher"),
+        _h(f" Version : pandorica v{pandorica_version}"),
+        _h(f" Date    : {now}"),
+        _h(" Project : https://github.com/RRobert92/pandorica"),
+        _h(" License : PolyForm Noncommercial 1.0.0"),
         _BANNER_BORDER,
-        "#",
-        "#  Please cite pandorica if it contributes to a publication:",
-        "#",
-        "#    @software{kiewisz_pandorica_2026,",
-        "#      author  = {Kiewisz, Robert},",
-        "#      title   = {pandorica: analytical tools for electron microscopy},",
-        "#      year    = {2026},",
-        f"#      version = {{v{pandorica_version}}},",
-        "#      url     = {https://github.com/RRobert92/pandorica},",
-        "#      license = {PolyForm-Noncommercial-1.0.0}",
-        "#    }",
-        "#",
+        _h(),
+        _h(" Please cite pandorica if it contributes to a publication:"),
+        _h(),
+        _h("   @software{kiewisz_pandorica_2026,"),
+        _h("     author  = {Kiewisz, Robert},"),
+        _h("     title   = {pandorica: analytical tools for electron microscopy},"),
+        _h("     year    = {2026},"),
+        _h(f"     version = {{v{pandorica_version}}},"),
+        _h("     url     = {https://github.com/RRobert92/pandorica},"),
+        _h("     license = {PolyForm-Noncommercial-1.0.0}"),
+        _h("   }"),
+        _h(),
         _BANNER_BORDER,
         "",
     ]
