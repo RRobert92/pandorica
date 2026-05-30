@@ -91,7 +91,10 @@ def run_stitch(
     cpd_coarse: bool = True,
     downscale: int = 1,
     use_gpu: Optional[bool] = None,
-    gpu_chunk: int = 4,
+    gpu_chunk: Optional[int] = None,
+    warp_coarse_px: int = 8,
+    trim_to_mts: bool = False,
+    mt_pad_frac: float = 0.05,
     workers: Optional[int] = None,
     log=print,
 ) -> dict:
@@ -108,7 +111,23 @@ def run_stitch(
     :param cpd_coarse: CPD multi-seed coarse rotation search (decoy-/±90°-robust).
     :param downscale: integer volume decimation (1 = full resolution).
     :param use_gpu: GPU warp; ``None`` = auto (CUDA→MPS→CPU), ``False`` = force CPU.
-    :param gpu_chunk: GPU Z-slice chunk (caps device memory).
+    :param gpu_chunk: Z-slice chunk for the GPU warp. ``None`` (default) sizes
+        the chunk from free CUDA memory so peak per-chunk allocation stays
+        under 50 % of free VRAM (clamped to [1, 64] slices). On MPS the query
+        API is unavailable; falls back to 4. Pass an explicit int to override.
+    :param warp_coarse_px: TPS displacement-grid spacing in canvas pixels
+        (default 8). The smooth warp is evaluated on a coarse canvas grid and
+        bilinearly interpolated to full resolution — sub-pixel error, but cuts
+        the dominant export cost from minutes to seconds. ``0`` forces the
+        original per-pixel evaluation.
+    :param trim_to_mts: size the output canvas to the microtubule bounding box
+        (with ``mt_pad_frac`` padding) instead of the section corner bbox. Drops
+        the empty-corner pixels that dominate a multi-section drifted canvas —
+        speeds the warp and shrinks the output by the same factor. Falls back to
+        the corner-bbox silently when no section has microtubules. Default
+        ``False``.
+    :param mt_pad_frac: padding fraction of the MT-bbox span when
+        ``trim_to_mts=True`` (per axis). Default ``0.05`` = 5 % context.
     :param workers: CPU processes for image-fill matching (``None`` = cpu_count − 2).
     :param log: line logger (default ``print``); receives each report line.
     :return: dict with output paths and a timing/settings report.
@@ -138,6 +157,9 @@ def run_stitch(
         f"z-blend     : {zblend}",
         f"image_fill  : {image_fill}  (metric={method})",
         f"GPU warp    : {gpu_on}  (device={device})",
+        f"GPU chunk   : {'auto (sized from free VRAM)' if gpu_chunk is None else f'{gpu_chunk} slices (manual)'}",
+        f"warp coarse : {warp_coarse_px} px  ({'full eval' if warp_coarse_px <= 0 else 'coarse + bilinear upsample'})",
+        f"trim to MTs : {trim_to_mts}  (pad={mt_pad_frac:.0%})" if trim_to_mts else f"trim to MTs : {trim_to_mts}",
         f"match workers: {workers}",
         "",
     ]
@@ -304,6 +326,9 @@ def run_stitch(
         image_warps=image_warps,
         use_gpu=gpu_on,
         gpu_chunk=gpu_chunk,
+        warp_coarse_px=warp_coarse_px,
+        trim_to_mts=trim_to_mts,
+        mt_pad_frac=mt_pad_frac,
         progress=lambda m, fr: log(f"  export: {m} ({fr * 100:.0f}%)"),
     )
     t_export = time.perf_counter() - t

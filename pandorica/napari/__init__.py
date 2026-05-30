@@ -24,11 +24,11 @@ Two dock widgets are contributed (see ``napari.yaml``):
   top-face until the microtubules line up, and save the per-interface coarse
   ``{angle, tx, ty}`` as ground truth (``coarse_gt.json``).
 
-Run it (the ``tardis`` conda env has both napari and tardis_em)::
+Run it (the conda env ships both napari and pandorica)::
 
-    conda run -n tardis napari            # then Plugins → TARDIS Serial Section Stitcher ...
+    conda run -n xyz napari            # then Plugins → PANDORICA Serial Section Stitcher ...
     # or headless launch with a folder pre-loaded:
-    conda run -n tardis python -m pandorica.napari <dataset_dir>
+    conda run -n xyz python -m pandorica.napari <dataset_dir>
 """
 
 __all__ = ["StitchValidatorWidget", "CoarseGTWidget"]

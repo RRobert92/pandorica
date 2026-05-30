@@ -23,7 +23,7 @@ and top field ``t_grid`` (high-Z); a uniform warp is just ``b_grid == t_grid``.
 mode='constant', cval=0)`` so GPU and CPU outputs agree (verified in tests).
 """
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -52,6 +52,92 @@ def pick_device(prefer_gpu: bool = True) -> str:
     if torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+
+def _per_slice_bytes(out_hw: Tuple[int, int], in_hw: Tuple[int, int]) -> int:
+    """
+    Bytes per Z-slice that :func:`warp_volume_torch` allocates on the device.
+
+    Per chunk it builds (all float32): the input slab ``vin`` (``4·Hin·Win``),
+    the displacement ``disp`` (``8·Hc·Wc``), the source coords ``src`` (``8``),
+    the sampling grid ``grid`` (``8``), the sampled output ``sampled`` (``4``)
+    and the cast/clamp temp ``chunk_out`` (``4``). Sum per slice ≈
+    ``32·Hc·Wc + 4·Hin·Win`` bytes. Persistent tensors (``out_t``, ``b_t``,
+    ``t_t``: ~24·Hc·Wc) are amortised across chunks and a small constant
+    relative to a multi-slice chunk, so they are not modelled here.
+    """
+    hc, wc = out_hw
+    hin, win = in_hw
+    return 32 * int(hc) * int(wc) + 4 * int(hin) * int(win)
+
+
+def device_free_bytes(device: str) -> Optional[int]:
+    """
+    Free device memory in bytes, or ``None`` when the device has no query API.
+
+    CUDA exposes :func:`torch.cuda.mem_get_info` (free, total). MPS has no
+    free-memory API as of torch 2.12 — return ``None`` and let callers choose
+    a conservative fallback.
+    """
+    try:
+        import torch
+    except Exception:  # noqa: BLE001
+        return None
+    if device == "cuda" and torch.cuda.is_available():
+        try:
+            free, _ = torch.cuda.mem_get_info()
+            return int(free)
+        except Exception:  # noqa: BLE001
+            return None
+    return None
+
+
+def auto_gpu_chunk(
+    device: str,
+    out_hw: Tuple[int, int],
+    in_hw: Tuple[int, int],
+    safety_frac: float = 0.5,
+    max_chunk: int = 64,
+    min_chunk: int = 1,
+    fallback: int = 4,
+) -> int:
+    """
+    Pick a Z-slice chunk size that fits in available device memory.
+
+    The export warp loop processes ``chunk`` slices at a time. Bigger chunks
+    amortise H2D/D2H overhead but raise peak device memory. We size the chunk
+    so peak per-chunk allocation stays under ``safety_frac`` of free device
+    memory, clamped to ``[min_chunk, max_chunk]``. ``safety_frac`` defaults to
+    0.5 so transient allocations elsewhere (other tensors, other processes)
+    do not OOM the device.
+
+    Returns ``fallback`` on:
+
+    * CPU device (no GPU memory to budget against)
+    * MPS (no free-memory API in torch — apply the fallback rather than guess)
+    * any query failure
+
+    :param device: ``'cuda'`` / ``'mps'`` / ``'cpu'``.
+    :param out_hw: output canvas ``(Hc, Wc)``.
+    :param in_hw: input section ``(Hin, Win)``.
+    :param safety_frac: fraction of free device memory we allow ourselves.
+    :param max_chunk: hard upper bound (returns diminish past ~64 on CUDA).
+    :param min_chunk: floor — must be ≥ 1.
+    :param fallback: used when no memory query is available for this device.
+    """
+    per_slice = _per_slice_bytes(out_hw, in_hw)
+    if per_slice <= 0 or device == "cpu":
+        return int(fallback)
+
+    free_bytes = device_free_bytes(device)
+    if free_bytes is None:
+        return int(fallback)
+
+    frac = max(0.05, min(0.95, float(safety_frac)))
+    budget = int(free_bytes * frac)
+    chunk = budget // per_slice
+    chunk = max(int(min_chunk), min(int(max_chunk), int(chunk)))
+    return chunk
 
 
 def warp_volume_torch(

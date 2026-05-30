@@ -12,8 +12,6 @@
 """
 Dependency-light block-matching primitives (cv2 + numpy only).
 
-Kept free of any ``tardis_em`` import so the multiprocessing workers (spawned on
-macOS) start cheaply — they re-import only this module, not the whole DL stack.
 Provides the pluggable, contrast-robust, masked, subpixel matcher used by
 :mod:`.image_warp` for image-fill, parallelised over grid cells.
 """

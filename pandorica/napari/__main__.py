@@ -13,7 +13,7 @@
 Headless launcher: open napari with both stitch widgets docked, optionally
 pre-pointing them at a dataset folder.
 
-    conda run -n tardis python -m pandorica.napari [dataset_dir]
+    conda run -n xyz python -m pandorica.napari [dataset_dir]
 """
 
 import sys
@@ -30,7 +30,7 @@ def main(argv=None) -> None:
     argv = sys.argv[1:] if argv is None else argv
     folder = argv[0] if argv else None
 
-    viewer = napari.Viewer(title="TARDIS Serial Section Stitcher")
+    viewer = napari.Viewer(title="PANDORICA — Serial Section Stitcher")
     validator = StitchValidatorWidget(viewer)
     gt = CoarseGTWidget(viewer)
     viewer.window.add_dock_widget(

@@ -3173,6 +3173,7 @@ napari = [
 [package.dev-dependencies]
 dev = [
     { name = "black" },
+    { name = "build" },
     { name = "flake8" },
     { name = "jupyter" },
     { name = "matplotlib" },
@@ -3212,6 +3213,7 @@ provides-extras = ["napari"]
 [package.metadata.requires-dev]
 dev = [
     { name = "black", specifier = ">23.0.0" },
+    { name = "build", specifier = ">=1.2.0" },
     { name = "flake8", specifier = ">5.0.0" },
     { name = "jupyter", specifier = ">=1.0.0" },
     { name = "matplotlib", specifier = ">3.5.2" },

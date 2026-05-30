@@ -7,6 +7,10 @@
 Automatic, no-landmark, whirlpool-safe stitching of a stack of serial-section
 electron tomograms into one volume with a merged microtubule (MT) network.
 
+> **New to the tool?** Start with [`HOW_IT_WORKS.md`](HOW_IT_WORKS.md) — a
+> plain-language tour of the pipeline, no math required. This README is the
+> dense reference.
+
 The pipeline is **MT-graph-driven**: it aligns sections by matching the
 microtubule endpoints that cross each section-to-section gap, with an image-only
 fallback when graphs are absent. It is self-contained (no napari / Qt) and runs

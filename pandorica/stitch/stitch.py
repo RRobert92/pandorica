@@ -145,6 +145,64 @@ def interface_rows(result, dataset: Dataset) -> List[Dict]:
 # --------------------------------------------------------------------------- #
 # Stitched volume + microtubule export
 # --------------------------------------------------------------------------- #
+def _displacement_grid_coarse(
+    framed_warp,
+    out_hw: Tuple[int, int],
+    out_pts: np.ndarray,
+    coarse_px: int = 8,
+) -> np.ndarray:
+    """
+    Evaluate ``framed_warp.displacement`` on a coarse canvas grid and
+    bilinearly upsample to every output pixel.
+
+    The TPS field is smooth by construction (diffeomorphism-guarded), so
+    sampling it on a coarse grid and bilinearly interpolating to canvas
+    resolution introduces sub-pixel error (~(coarse_px)² × local field
+    curvature) while replacing the dominant cost of full-canvas RBF
+    evaluation. ``coarse_px=0`` (or any ≥ min(Hc, Wc)) → falls back to full
+    per-pixel evaluation.
+
+    The grid is **canvas-relative**, so spacing stays at ``coarse_px``
+    regardless of input size: an 8000-px-wide canvas uses ~1000 samples
+    across; a 256-px-wide canvas uses ~32 — no special small-data branch.
+
+    :param framed_warp: object exposing ``.displacement(xy)``; ``xy`` is
+        ``[M, 2]`` ``(x, y)`` in canvas pixels.
+    :param out_hw: output canvas ``(Hc, Wc)``.
+    :param out_pts: ``[M, 2]`` query points (``(x, y)``, canvas pixels).
+    :param coarse_px: target sample spacing in canvas pixels. ``0`` or a
+        value at least as large as ``min(Hc, Wc)`` → no optimization.
+    :return: ``[M, 2]`` ``(dx, dy)`` displacements at ``out_pts``.
+    """
+    hc, wc = out_hw
+    if coarse_px <= 0 or coarse_px >= min(hc, wc):
+        return np.asarray(framed_warp.displacement(out_pts), dtype=np.float32)
+
+    # Coarse-grid dimensions: ceil so spacing never exceeds coarse_px. +1 puts
+    # both endpoints (0 and Hc-1 / Wc-1) on the grid, so the bilinear
+    # interpolator never extrapolates.
+    n_y = max(2, int(np.ceil((hc - 1) / coarse_px)) + 1)
+    n_x = max(2, int(np.ceil((wc - 1) / coarse_px)) + 1)
+    y_c = np.linspace(0.0, hc - 1, n_y, dtype=np.float64)
+    x_c = np.linspace(0.0, wc - 1, n_x, dtype=np.float64)
+    xx, yy = np.meshgrid(x_c, y_c, indexing="xy")  # both (n_y, n_x)
+    coarse_xy = np.column_stack([xx.ravel(), yy.ravel()]).astype(np.float64)
+    coarse_d = np.asarray(framed_warp.displacement(coarse_xy)).reshape(n_y, n_x, 2)
+
+    # map_coordinates wants (row, col) = (y_idx, x_idx) in coarse-grid index
+    # units; out_pts is (x, y) in canvas pixels, so divide each by the
+    # coarse-grid spacing along its axis.
+    y_step = (hc - 1) / (n_y - 1)
+    x_step = (wc - 1) / (n_x - 1)
+    yi = out_pts[:, 1].astype(np.float64) / y_step
+    xi = out_pts[:, 0].astype(np.float64) / x_step
+    coords = np.stack([yi, xi], axis=0)  # (2, M)
+
+    dx = map_coordinates(coarse_d[..., 0], coords, order=1, mode="nearest")
+    dy = map_coordinates(coarse_d[..., 1], coords, order=1, mode="nearest")
+    return np.column_stack([dx, dy]).astype(np.float32)
+
+
 def _warp_volume_zblend(
     volume,
     inv_pose: Pose,
@@ -195,6 +253,59 @@ def _corner_bbox(
     return hc, wc, -mn  # offset (ox, oy) maps bbox-min -> (0, 0)
 
 
+def _mt_bbox(
+    dataset: Dataset,
+    poses_px: Sequence[Pose],
+    px: float,
+    pad_frac: float = 0.05,
+    fallback_hw: Optional[Tuple[int, int]] = None,
+) -> Tuple[int, int, np.ndarray]:
+    """
+    Canvas ``(Hc, Wc)`` and offset sized to enclose every microtubule after pose
+    transform, padded by ``pad_frac`` of the MT-bbox span on each side.
+
+    The corner-bbox (:func:`_corner_bbox`) sizes the canvas to fit every input
+    frame after pose transform, which is conservative: with N sections drifting
+    apart, most of the canvas is empty corners. Trimming to the MT bbox cuts the
+    output volume to just the spatial region that carries microtubules, and the
+    warp / disk-write cost drops in proportion.
+
+    MT coords on a section are stored in physical units (Å, columns 1 and 2 of
+    the ``[id, x, y, z]`` graph); ``poses_px`` is in canvas pixels, so we divide
+    by ``px`` first to get pixel-frame inputs.
+
+    :param dataset: loaded sections (their ``.coords`` are read here).
+    :param poses_px: pixel-frame absolute poses (length == n sections).
+    :param px: pixel size in physical units (Å/pixel).
+    :param pad_frac: padding as a fraction of the MT-bbox span (per axis). ``0.05``
+        gives 5 % context on every side, scaling with the stack.
+    :param fallback_hw: ``(h, w)`` to use for the corner-bbox fallback when no
+        section has microtubules. ``None`` → return ``(0, 0, zeros(2))``.
+    :return: ``(Hc, Wc, offset)`` in the same shape as :func:`_corner_bbox`.
+    """
+    all_xy = []
+    for i, s in enumerate(dataset.sections):
+        c = getattr(s, "coords", None)
+        if c is None or len(c) == 0:
+            continue
+        xy_px = c[:, 1:3] / max(px, 1e-12)  # MT (x, y) in input pixel coords
+        all_xy.append(apply_pose(poses_px[i], xy_px))
+
+    if not all_xy:
+        if fallback_hw is not None:
+            return _corner_bbox(poses_px, fallback_hw[0], fallback_hw[1])
+        return 0, 0, np.zeros(2)
+
+    pts = np.vstack(all_xy)
+    mn, mx = pts.min(0), pts.max(0)
+    pad = (mx - mn) * float(max(pad_frac, 0.0))
+    mn = mn - pad
+    mx = mx + pad
+    wc = int(np.ceil(mx[0] - mn[0]))
+    hc = int(np.ceil(mx[1] - mn[1]))
+    return hc, wc, -mn
+
+
 def export_stitched(
     dataset: Dataset,
     poses: Sequence[Pose],
@@ -206,7 +317,10 @@ def export_stitched(
     warp_zblend: bool = False,
     image_warps: Optional[Sequence] = None,
     use_gpu: bool = False,
-    gpu_chunk: int = 4,
+    gpu_chunk: Optional[int] = None,
+    warp_coarse_px: int = 8,
+    trim_to_mts: bool = False,
+    mt_pad_frac: float = 0.05,
 ) -> Dict[str, str]:
     """
     Write a stitched volume + merged microtubule graph under the solved poses.
@@ -245,6 +359,14 @@ def export_stitched(
         MT-free regions from image content. Summed with the MT warp per interface
         (same section-k frame) and carried through identically, including the
         Z-blend. May be given with or without ``warps`` (latter = image-only).
+    :param trim_to_mts: if True, size the canvas to the bounding box of the
+        microtubules (with ``mt_pad_frac`` padding) instead of every section's
+        corners. Drops empty-corner pixels — speeds the warp + reduces output
+        size by the same factor. Falls back to the corner-bbox when no section
+        has microtubules. Default ``False`` (no behaviour change for callers
+        that did not opt in).
+    :param mt_pad_frac: padding fraction of the MT-bbox span on each axis when
+        ``trim_to_mts=True``. ``0.05`` = 5 % context on each side.
     :return: dict of written paths (``volume``, ``graph``, ``log`` as available).
     """
     from tardis_em.utils.export_data import to_am_streamed, NumpyToAmira
@@ -256,8 +378,13 @@ def export_stitched(
     makedirs(output_dir, exist_ok=True)
     n = len(dataset.sections)
     assert n == len(poses), f"poses ({len(poses)}) must match sections ({n})"
+    try:
+        from pandorica._version import version as _PV
+    except Exception:  # noqa: BLE001
+        _PV = "?"
     log: List[str] = [
-        "TARDIS stitch-validator export",
+        f"PANDORICA serial-section stitch export  (pandorica v{_PV})",
+        "  (also reachable via the tardis_stitch console script when tardis_em is installed)",
         f"folder:     {dataset.folder}",
         f"sections:   {n}",
         f"downscale:  {downscale}",
@@ -304,13 +431,34 @@ def export_stitched(
     # ----------------------------- volume -------------------------------------
     z_thickness = [0] * n  # slice counts (for the graph's Z stacking)
     if write_volume and h is not None:
-        hc, wc, offset = _corner_bbox(poses_px, h, w)
-        log += [
-            f"pixel size: {px:g}",
-            f"canvas HxW: {hc} x {wc}",
-            f"offset px:  ({offset[0]:.1f}, {offset[1]:.1f})",
-            "",
-        ]
+        if trim_to_mts:
+            hc, wc, offset = _mt_bbox(
+                dataset,
+                poses_px,
+                px=px,
+                pad_frac=mt_pad_frac,
+                fallback_hw=(h, w),
+            )
+            full_hc, full_wc, _ = _corner_bbox(poses_px, h, w)
+            full_area = max(full_hc * full_wc, 1)
+            ratio = (hc * wc) / full_area
+            delta_pct = abs(100.0 * (1.0 - ratio))
+            verb = "smaller" if ratio <= 1.0 else "larger"
+            log += [
+                f"pixel size: {px:g}",
+                f"canvas HxW: {hc} x {wc}  (MT-trim, pad={mt_pad_frac:.0%})",
+                f"  vs corner: {full_hc} x {full_wc}  -> {delta_pct:.1f}% {verb}",
+                f"offset px:  ({offset[0]:.1f}, {offset[1]:.1f})",
+                "",
+            ]
+        else:
+            hc, wc, offset = _corner_bbox(poses_px, h, w)
+            log += [
+                f"pixel size: {px:g}",
+                f"canvas HxW: {hc} x {wc}",
+                f"offset px:  ({offset[0]:.1f}, {offset[1]:.1f})",
+                "",
+            ]
 
         def _frame_off(j: int) -> Pose:
             """Section j's absolute pixel pose, shifted by the canvas offset."""
@@ -328,11 +476,29 @@ def export_stitched(
             out_pts = np.column_stack([xx.ravel(), yy.ravel()]).astype(np.float32)
 
         gpu_device = None
+        effective_chunk = int(gpu_chunk) if gpu_chunk is not None else 4
         if use_gpu:
             from pandorica.stitch import accel as _accel
 
             gpu_device = _accel.pick_device(True)
             log.append(f"GPU warp device: {gpu_device}")
+            if gpu_chunk is None and gpu_device not in (None, "cpu"):
+                effective_chunk = _accel.auto_gpu_chunk(
+                    gpu_device,
+                    out_hw=(hc, wc),
+                    in_hw=(h, w),
+                )
+                free_bytes = _accel.device_free_bytes(gpu_device)
+                free_str = (
+                    f"{free_bytes / 1e9:.1f} GB free"
+                    if free_bytes is not None
+                    else "no memory query"
+                )
+                log.append(
+                    f"GPU chunk    : auto -> {effective_chunk} slices  ({free_str})"
+                )
+            else:
+                log.append(f"GPU chunk    : {effective_chunk} slices  (manual)")
 
         full_z = 0
         temp = []
@@ -354,8 +520,11 @@ def export_stitched(
                     b_grid = (
                         (
                             0.5
-                            * _FramedWarp(wb, _frame_off(i - 1), px).displacement(
-                                out_pts
+                            * _displacement_grid_coarse(
+                                _FramedWarp(wb, _frame_off(i - 1), px),
+                                (hc, wc),
+                                out_pts,
+                                coarse_px=warp_coarse_px,
                             )
                         ).astype(np.float32)
                         if wb is not None
@@ -364,7 +533,12 @@ def export_stitched(
                     t_grid = (
                         (
                             -0.5
-                            * _FramedWarp(wt, _frame_off(i), px).displacement(out_pts)
+                            * _displacement_grid_coarse(
+                                _FramedWarp(wt, _frame_off(i), px),
+                                (hc, wc),
+                                out_pts,
+                                coarse_px=warp_coarse_px,
+                            )
                         ).astype(np.float32)
                         if wt is not None
                         else np.zeros_like(out_pts)
@@ -381,7 +555,7 @@ def export_stitched(
                             b_grid,
                             t_grid,
                             device=gpu_device,
-                            chunk=gpu_chunk,
+                            chunk=effective_chunk,
                             out=fout,
                         )
                     else:

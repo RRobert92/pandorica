@@ -28,7 +28,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 # Shown when a folder has files but none can be paired into stitchable sections.
-# Kept short (≤ a few lines) so it renders cleanly inside the TARDIS logo box.
+# Kept short (≤ a few lines) so it renders cleanly inside the PANDORICA log header.
 _EXPECTED_LAYOUT = (
     "Expected per section — rename so the image and its graph pair:\n"
     "  <name>_sec01.am               image  (defines 'Lattice')\n"

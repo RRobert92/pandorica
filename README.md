@@ -13,9 +13,9 @@ Analytical tools for electron microscopy.
 
 - **`pandorica.stitch`** — serial-section tomogram stitcher: MT-graph-driven
   alignment with an image-only fallback, diffeomorphism-guarded TPS warp,
-  global pose solve, CPU/GPU volume export. See
-  [`pandorica/stitch/README.md`](pandorica/stitch/README.md) for the method
-  and related-work references.
+  global pose solve, CPU/GPU volume export.
+  Plain-language tour: [`HOW_IT_WORKS.md`](pandorica/stitch/HOW_IT_WORKS.md).
+  Dense reference: [`pandorica/stitch/README.md`](pandorica/stitch/README.md).
 - **`pandorica.napari`** — napari plugin: visually validate the stitcher on
   real datasets and record coarse-alignment ground truth by hand.
 
