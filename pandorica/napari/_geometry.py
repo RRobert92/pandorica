@@ -48,6 +48,40 @@ def coords_to_points_zyx(coords: np.ndarray) -> np.ndarray:
     return xyz[:, [2, 1, 0]]  # (x, y, z) -> (z, y, x)
 
 
+def coords_to_paths_zyx(coords: np.ndarray) -> List[np.ndarray]:
+    """``[N, 4]`` (id, x, y, z) graph → list of ``[Mi, 3]`` polylines in napari ``(z, y, x)``.
+
+    Each output array is the ordered point sequence of one filament/segment.
+    Order is preserved within a segment (the input row order is assumed to
+    reflect the along-filament order, matching the convention used by
+    ``pandorica.io.amira.read_segmented_points``). Single-point segments are
+    dropped — a path needs at least 2 points to render as a line in napari.
+
+    Used by the napari widget to render MT/spatial-graph filaments as splines
+    via ``viewer.add_shapes(path)`` instead of unstructured points.
+    """
+    coords = np.asarray(coords, dtype=float)
+    if len(coords) == 0 or coords.shape[1] < 4:
+        return []
+    ids = coords[:, 0]
+    xyz = coords[:, 1:4]
+    # Group by id while preserving in-segment order. np.unique with return_index
+    # would re-sort by id; we want sorted-by-id but stable within each segment.
+    sort_idx = np.argsort(ids, kind="stable")
+    sorted_ids = ids[sort_idx]
+    sorted_xyz = xyz[sort_idx]
+    # Find segment boundaries
+    boundaries = np.where(np.diff(sorted_ids) != 0)[0] + 1
+    segments_xyz = np.split(sorted_xyz, boundaries)
+    paths: List[np.ndarray] = []
+    for seg in segments_xyz:
+        if len(seg) < 2:
+            continue
+        # (x, y, z) -> (z, y, x) for napari
+        paths.append(seg[:, [2, 1, 0]])
+    return paths
+
+
 def napari_affine(pose: Pose) -> np.ndarray:
     """
     4×4 napari affine (data ``(z, y, x)`` order) equivalent to ``apply_pose`` on XY.
@@ -79,6 +113,78 @@ def napari_affine_2d(pose: Pose) -> np.ndarray:
         [
             [sc * c, sc * s, pose["Ty"]],  # y'
             [-sc * s, sc * c, pose["Tx"]],  # x'
+            [0.0, 0.0, 1.0],
+        ]
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Anisotropic (Sx, Sy) display helpers — GT recorder only
+# --------------------------------------------------------------------------- #
+# Plastic-section EM often suffers anisotropic compression along the knife's
+# cutting axis (~5-15% typical). The CoarseGTWidget exposes Sx, Sy independently
+# so the operator can record this. These helpers transform points and build
+# napari affines for the *display* path — the pipeline's Pose type stays
+# isotropic by design (see project_export_perf_landscape memory).
+#
+# Operation order, matching centroid_pose's semantics generalised:
+#   x'' = R · diag(sx, sy) · (x − c) + c + (tx, ty)
+# where c is the rotation/scaling centre and R is the CCW rotation by angle.
+
+
+def apply_anisotropic_xy(
+    points_xy: np.ndarray,
+    angle_deg: float,
+    tx: float,
+    ty: float,
+    sx: float,
+    sy: float,
+    center_xy: np.ndarray,
+) -> np.ndarray:
+    """
+    Apply anisotropic scale + rotation about a centre + translation to ``[N, 2]`` XY.
+
+    Drops to the same math as ``centroid_pose`` + ``apply_pose`` when ``sx == sy``.
+    """
+    a = np.deg2rad(angle_deg)
+    c, s = np.cos(a), np.sin(a)
+    p = np.asarray(points_xy, dtype=float)
+    if len(p) == 0:
+        return p.copy()
+    cx, cy = float(center_xy[0]), float(center_xy[1])
+    x_local = p[:, 0] - cx
+    y_local = p[:, 1] - cy
+    x_out = c * sx * x_local - s * sy * y_local + cx + tx
+    y_out = s * sx * x_local + c * sy * y_local + cy + ty
+    return np.column_stack([x_out, y_out])
+
+
+def napari_affine_2d_anisotropic(
+    angle_deg: float,
+    tx: float,
+    ty: float,
+    sx: float,
+    sy: float,
+    center_xy: np.ndarray,
+) -> np.ndarray:
+    """3×3 napari affine (data ``(y, x)`` order) for anisotropic scale + rotation + translation.
+
+    Equivalent to :func:`napari_affine_2d` of a ``centroid_pose`` when
+    ``sx == sy``; with independent Sx, Sy the linear part becomes the general
+    ``R · diag(sx, sy)``. Used to drive the GT recorder's moving-face image
+    layer without resampling.
+    """
+    a = np.deg2rad(angle_deg)
+    c, s = np.cos(a), np.sin(a)
+    cx, cy = float(center_xy[0]), float(center_xy[1])
+    # Translation in the output frame: centre stays put under the linear part,
+    # then add (tx, ty). Derived from x_out / y_out above.
+    tx_const = cx + tx - c * sx * cx + s * sy * cy
+    ty_const = cy + ty - s * sx * cx - c * sy * cy
+    return np.array(
+        [
+            [c * sy, s * sx, ty_const],  # y'
+            [-s * sy, c * sx, tx_const],  # x'
             [0.0, 0.0, 1.0],
         ]
     )

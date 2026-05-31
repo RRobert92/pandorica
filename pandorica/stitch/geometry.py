@@ -88,22 +88,31 @@ def zmax_face(
 
 
 def centroid_pose(
-    angle_deg: float, tx: float, ty: float, center_xy: np.ndarray
+    angle_deg: float,
+    tx: float,
+    ty: float,
+    center_xy: np.ndarray,
+    scale: float = 1.0,
 ) -> Pose:
     """
-    Pose that rotates by ``angle_deg`` about ``center_xy`` then translates by (tx, ty).
+    Pose that scales by ``scale`` and rotates by ``angle_deg`` about ``center_xy``,
+    then translates by ``(tx, ty)``.
 
-    This is the natural parametrisation for the GT recorder: rotating the moving
+    Natural parametrisation for the GT recorder: rotating and scaling the moving
     face about its own centroid keeps it near the fixed face while the operator
-    dials in the angle, then (tx, ty) nudges it into place.
+    dials in angle / scale, then ``(tx, ty)`` nudges it into place. Equivalent to
+    ``x' = scale·R·(x − c) + c + (tx, ty)`` — a centred similarity transform.
+    Default ``scale=1.0`` preserves the prior signature (rigid-only callers
+    don't need to opt in).
     """
     a = np.deg2rad(angle_deg)
     R = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
     c = np.asarray(center_xy, dtype=float)
-    t = c - R @ c + np.array([tx, ty], dtype=float)
+    s = float(scale)
+    t = c - s * (R @ c) + np.array([tx, ty], dtype=float)
     return {
         "Angle": float(angle_deg),
         "Tx": float(t[0]),
         "Ty": float(t[1]),
-        "Scale": 1.0,
+        "Scale": s,
     }

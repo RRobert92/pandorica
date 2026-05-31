@@ -105,6 +105,19 @@ End to end, for a stack of *n* sections (`pipeline/stitcher.py` →
    auto-selected and memory-bounded (`accel.py`). Outputs: a stitched `.am`
    volume, a merged `*_spatialGraph.am`, and a detailed log.
 
+   Three export kwargs (all surfaced as `run_stitch` and CLI flags) tune cost vs
+   fidelity:
+
+   | kwarg | default | what it does |
+   |---|---|---|
+   | `warp_coarse_px` | `8` | TPS displacement is sampled on an `(Hc/N) × (Wc/N)` coarse grid and bilinearly upsampled to canvas pixels (`_displacement_grid_coarse`). The guarded TPS is smooth by construction, so sub-pixel error scales ~ `coarse_px² · field_curvature`. Set to `0` for full per-pixel RBF eval. ~21× faster on a full-res canvas. Applies to both the Z-blend and uniform-warp branches. |
+   | `gpu_chunk` | `None` → auto | Z-slices per `grid_sample` call in `accel.warp_volume_torch`. `None` budgets ~50 % of free CUDA memory (`accel.auto_gpu_chunk`); MPS has no free-memory API so it falls back to 4. Hard-coded `4` left ~10× throughput on the table on 24 GB+ cards. |
+   | `trim_to_mts` (+ `mt_pad_frac`) | `False` (5 %) | Sizes the canvas to the MT-bbox + padding (`_mt_bbox`) instead of every section's corners. Drops empty-corner pixels — warp + disk-write scale with output area. Opt-in: a no-MT or sparse-MT section's volume would lose pixels otherwise. Falls back to corner-bbox when no section has MTs. |
+
+   All three are independent (any subset can be set), and the `Settings (full
+   kwargs for reproduction)` block of `stitch_log.txt` records the values
+   actually used, so a re-run with the same flags is exact.
+
 ## Module map
 
 ```

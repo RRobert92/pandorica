@@ -276,6 +276,76 @@ like the MT path but driven by pixels instead of stubs.
 
 ---
 
+## Tuning the export — three knobs that change wall time
+
+The stitching math is the same regardless of settings, but the final step
+(warping every input voxel into the output canvas) can be sped up by an
+order of magnitude on a real-size dataset. Three knobs, each safe to leave
+at its default:
+
+### 1. Coarse warp grid — `warp_coarse_px`
+
+The smooth bend (TPS) is **smooth by construction** — neighbouring pixels
+get almost the same displacement. So instead of asking "where does *each
+output pixel* come from?" once per pixel (slow), we ask it on a coarse grid
+and fill in the gaps by linear interpolation:
+
+```
+   FULL evaluation                COARSE + interpolate
+   (one ? per pixel)              (one ? per 8 px, then interp.)
+
+   ? ? ? ? ? ? ? ?                ?               ?
+   ? ? ? ? ? ? ? ?                
+   ? ? ? ? ? ? ? ?                
+   ? ? ? ? ? ? ? ?                                
+   ? ? ? ? ? ? ? ?                ?               ?
+                                  (4 questions, not 64)
+```
+
+Default is 8 px. A smooth bend changes by a fraction of a pixel over 8 px,
+so the error you get back is sub-pixel — invisible at typical EM contrast.
+Set `warp_coarse_px=0` to fall back to the full per-pixel evaluation if you
+ever need to compare.
+
+### 2. Auto GPU chunk size — `gpu_chunk`
+
+On the GPU, the warp is run a few Z-slices at a time so the device never has
+to hold the whole multi-GB volume in memory. The "few" is the chunk size.
+Too small wastes throughput; too big risks an out-of-memory crash.
+
+Default `None` asks CUDA how much memory is free and picks a chunk that uses
+about half of it — so a 24 GB card gets a bigger chunk than a 8 GB card,
+automatically. (Apple's MPS has no free-memory query, so it conservatively
+uses a small chunk.) Set an integer to override if you know better.
+
+### 3. Trim canvas to the microtubules — `trim_to_mts`
+
+When sections drift apart over a long stack, the bounding box that fits
+*every* section's corners is much larger than the region that actually
+contains microtubules. Most of the output canvas is empty corners.
+
+```
+       FULL CORNER BBOX                  TRIM TO MTs (with padding)
+
+       ┌───────────────────┐             
+       │ . . . . . . . . . │             
+       │ . . . . . . . . . │                 ┌───────────┐
+       │ . . . ███████ . . │                 │  ███████  │
+       │ . . ███████████ . │                 │ ██████████│
+       │ . . . ███████ . . │                 │  ███████  │
+       │ . . . . . . . . . │                 └───────────┘
+       │ . . . . . . . . . │             
+       └───────────────────┘             
+       (most pixels are empty)           (only the MT-containing area)
+```
+
+Turning this on (`trim_to_mts=True`) makes the warp work on the smaller
+canvas — proportional savings in both warp time and disk size. It is
+**opt-in** because if you have sections without any microtubules, their
+content would be cropped out.
+
+---
+
 ## Summary in one paragraph
 
 The stitcher pairs **microtubule cut-ends** across each section interface to

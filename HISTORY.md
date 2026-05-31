@@ -5,6 +5,55 @@ All notable changes to pandorica are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] — 2026-05-31
+
+### Added
+
+- **napari reader plugin for AmiraMesh `.am` files.** Drag-and-drop or
+  `File → Open` of `.am` files now opens them as the right layer type:
+  spatial graphs (`*_spatialGraph.am`, or any file whose header declares
+  `VERTEX` / `EDGE` / `HxSpatialGraph`) become a Shapes layer with each
+  filament rendered as a connected `path`; volumes (`Lattice` header)
+  become Image layers with isotropic Å scale. Implemented in
+  `pandorica/napari/_reader.py`; registered via the `napari.yaml` manifest.
+- **`Browse files…` button** in `CoarseGTWidget` / `StitchValidatorWidget`
+  for picking individual `.am` files (volumes + spatial graphs) instead
+  of pointing at a folder. Auto-pairs volumes with their matching
+  `_spatialGraph.am` by stem containment, falls back to graph-only
+  sections for unpaired graphs.
+- **Spatial graphs render as splines** by default in the napari widget
+  (toggleable via `Render spatial graphs as splines` checkbox; falls
+  back to the prior point-cloud display when off). New helper
+  `pandorica.napari._geometry.coords_to_paths_zyx(coords)` groups
+  `[N, 4]` per-segment-id, preserves in-segment order, drops
+  single-point segments, and converts to napari `(z, y, x)` order.
+- **`allow_scale: bool = False` and `lambda_scale: float = 1.0` kwargs**
+  exposed on `pandorica.stitch.cli.run_stitch`. Forwards to
+  `stitch_sections` so per-section isotropic scale estimation and the
+  scale→1 prior are now opt-in from the CLI / `tardis_stitch` (the
+  flags were already in `stitch_sections` but were never wired through).
+- **`rich.progress.Progress` bar for export warping.** Replaces the
+  prior N-line text progress with a single live-updating bar (description,
+  percent, elapsed/remaining). Falls back to plain prints when stdout
+  isn't a TTY (piped logs, CI capture) so log files stay clean.
+
+### Reverted before release
+
+A short-lived `Pose.Flip` plumbing (flip-aware Procrustes + Fourier-Mellin
+flip enumeration + napari widget flip checkbox + GT JSON `"flip"` field)
+was prototyped against this version but proved too unreliable on real
+EM cross-sections during field testing. Removed from production before
+release; the prototype code is preserved at `tmp/flip_apparatus/` for
+possible future revival. See that folder's `README.md` and project
+memory `project_image_only_ceiling.md` for the empirical findings.
+
+### Notes for tardis_em integration
+
+The `run_stitch` signature grew from 15 to 17 kwargs (`allow_scale`,
+`lambda_scale`). `tardis_em`'s introspection wrapper picks these up
+automatically after `pip install -U pandorica`; no manifest changes
+needed on the tardis side.
+
 ## [1.0.3] — 2026-05-30
 
 ### Changed

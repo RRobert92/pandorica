@@ -8,8 +8,15 @@ contributions:
     - id: pandorica.coarse_gt
       python_name: pandorica.napari._widget:CoarseGTWidget
       title: Coarse GT Recorder
+    - id: pandorica.read_amiramesh
+      python_name: pandorica.napari._reader:napari_get_reader
+      title: Read AmiraMesh (.am)
   widgets:
     - command: pandorica.stitch_validator
       display_name: Serial Section Stitcher
     - command: pandorica.coarse_gt
       display_name: Coarse GT Recorder
+  readers:
+    - command: pandorica.read_amiramesh
+      filename_patterns: ["*.am"]
+      accepts_directories: false

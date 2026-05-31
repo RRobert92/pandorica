@@ -26,7 +26,7 @@ per-interface records (source, flagged, diagnostics) for QC.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence
 
 import numpy as np
 
@@ -75,6 +75,7 @@ def hybrid_coarse(
     continuity_tol: float = 30.0,
     search_kwargs: Optional[dict] = None,
     ap_kwargs: Optional[dict] = None,
+    progress: Optional[Callable[[int, int, float], None]] = None,
 ) -> HybridCoarseResult:
     """
     Compute stack coarse rotations by the hybrid (MT search + A–P sign + continuity).
@@ -85,6 +86,12 @@ def hybrid_coarse(
     :param continuity_tol: trend tolerance (deg) for resolving flagged interfaces.
     :param search_kwargs / ap_kwargs: forwarded to ``global_rotation_search`` /
         ``ap_rotation_hint``.
+    :param progress: optional ``(k_done, n_total, angle_for_k)`` callback fired
+        once per interface after its rotation estimate completes. ``k_done`` runs
+        ``0..n_total-1``; ``angle_for_k`` is the just-computed raw estimate (deg).
+        The final resolved angles in ``HybridCoarseResult.angles`` may differ
+        from the per-interface estimates after the stack-wide A–P / continuity
+        pass — callers wanting the final angles should read them off the return.
     :return: a ``HybridCoarseResult``.
     """
     sk = dict(search_kwargs or {})
@@ -97,13 +104,16 @@ def hybrid_coarse(
         ref = _face(coords_list[k], "top", z_band_fraction)
         mov = _face(coords_list[k + 1], "bottom", z_band_fraction)
         rho = _endpoint_rho(ref) if len(ref) >= 2 else 1.0
-        estimates.append(global_rotation_search(ref, mov, rho, **sk))
+        est = global_rotation_search(ref, mov, rho, **sk)
+        estimates.append(est)
         if section_images is not None:
             ap_angles.append(
                 ap_rotation_hint(section_images[k], section_images[k + 1], **ak)
             )
         else:
             ap_angles.append(None)
+        if progress is not None:
+            progress(k, n - 1, float(est.angle))
 
     records = resolve_stack_rotations(estimates, ap_angles)
     _continuity_resolve(records, continuity_tol)

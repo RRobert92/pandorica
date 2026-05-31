@@ -147,7 +147,7 @@ def run_stitch(
     output_dir: Optional[str] = None,
     *,
     image_fill: bool = True,
-    method: str = "mi",
+    method: str = "ncc",
     warp_omega: float = 0.3,
     zblend: bool = True,
     cpd_coarse: bool = True,
@@ -158,6 +158,8 @@ def run_stitch(
     trim_to_mts: bool = False,
     mt_pad_frac: float = 0.05,
     workers: Optional[int] = None,
+    allow_scale: bool = False,
+    lambda_scale: float = 1.0,
     log=print,
 ) -> dict:
     """
@@ -167,7 +169,9 @@ def run_stitch(
         (microtubules). Discovered/paired by ``sort_tomogram_files``.
     :param output_dir: output folder (default ``<input_dir>/stitched_output``).
     :param image_fill: also align MT-free regions from image content (needs volumes).
-    :param method: image-fill matching metric — ``'mi'`` / ``'grad'`` / ``'ncc'``.
+    :param method: image-fill matching metric — ``'ncc'`` (default, cv2 FFT, fast),
+        ``'grad'`` (NCC on edge maps), ``'mi'`` (mutual information; ~2× slower,
+        helps only for cross-modality / contrast-mismatched faces).
     :param warp_omega: TPS vorticity bound (lower = smoother / fewer whirlpools).
     :param zblend: Z-varying symmetric warp (else one warp per section).
     :param cpd_coarse: CPD multi-seed coarse rotation search (decoy-/±90°-robust).
@@ -191,6 +195,15 @@ def run_stitch(
     :param mt_pad_frac: padding fraction of the MT-bbox span when
         ``trim_to_mts=True`` (per axis). Default ``0.05`` = 5 % context.
     :param workers: CPU processes for image-fill matching (``None`` = cpu_count − 2).
+    :param allow_scale: also estimate a per-section isotropic scale in the
+        Procrustes fit and the global solve. Default ``False`` keeps Scale=1.0
+        for every section (matches the prior behavior). Enable when you
+        actually need scale recovery — e.g. when ASCII-vs-binary readers or
+        section-thickness mismatch produce a per-section scale offset.
+    :param lambda_scale: weight of the scale→1 prior in the global solve
+        (only active with ``allow_scale=True``). Higher = pulled harder
+        toward 1; default ``1.0`` is a mild bias that suppresses greedy's
+        multiplicative scale drift while still letting the solve adapt.
     :param log: line logger (default ``print``); receives each report line.
     :return: dict with output paths and a timing/settings report.
     """
@@ -278,7 +291,11 @@ def run_stitch(
     t = time.perf_counter()
     if use_mt:
         result = stitch_sections(
-            coords, warp_omega_max=warp_omega, cpd_coarse=cpd_coarse
+            coords,
+            warp_omega_max=warp_omega,
+            cpd_coarse=cpd_coarse,
+            allow_scale=allow_scale,
+            lambda_scale=lambda_scale,
         )
         poses = stitch.result_poses(result)
         mt_warps = stitch.result_warps(result)
@@ -374,22 +391,66 @@ def run_stitch(
 
     # --- export ------------------------------------------------------------ #
     t = time.perf_counter()
-    written = stitch.export_stitched(
-        ds,
-        poses,
-        out,
-        downscale=downscale,
-        write_volume=has_vol,
-        warps=mt_warps,
-        warp_zblend=zblend,
-        image_warps=image_warps,
-        use_gpu=gpu_on,
-        gpu_chunk=gpu_chunk,
-        warp_coarse_px=warp_coarse_px,
-        trim_to_mts=trim_to_mts,
-        mt_pad_frac=mt_pad_frac,
-        progress=lambda m, fr: log(f"  export: {m} ({fr * 100:.0f}%)"),
-    )
+    # rich Progress bar with a single live-updating line (replaces the prior
+    # one-line-per-tick log). Falls back to plain prints when stdout isn't a
+    # TTY (piped logs, CI capture) so log files don't fill with ANSI noise.
+    import sys as _sys
+
+    use_rich_bar = _sys.stdout.isatty()
+    if use_rich_bar:
+        from rich.progress import (
+            BarColumn,
+            Progress,
+            TaskProgressColumn,
+            TextColumn,
+            TimeElapsedColumn,
+            TimeRemainingColumn,
+        )
+
+        with Progress(
+            TextColumn("  export: [progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TextColumn("•"),
+            TimeElapsedColumn(),
+            TextColumn("/"),
+            TimeRemainingColumn(),
+            transient=False,
+        ) as _prog:
+            _task = _prog.add_task("starting…", total=1000)
+
+            def _export_progress(m: str, fr: float) -> None:
+                _prog.update(_task, completed=int(fr * 1000), description=m)
+
+            written = stitch.export_stitched(
+                ds, poses, out,
+                downscale=downscale,
+                write_volume=has_vol,
+                warps=mt_warps,
+                warp_zblend=zblend,
+                image_warps=image_warps,
+                use_gpu=gpu_on,
+                gpu_chunk=gpu_chunk,
+                warp_coarse_px=warp_coarse_px,
+                trim_to_mts=trim_to_mts,
+                mt_pad_frac=mt_pad_frac,
+                progress=_export_progress,
+            )
+    else:
+        written = stitch.export_stitched(
+            ds, poses, out,
+            downscale=downscale,
+            write_volume=has_vol,
+            warps=mt_warps,
+            warp_zblend=zblend,
+            image_warps=image_warps,
+            use_gpu=gpu_on,
+            gpu_chunk=gpu_chunk,
+            warp_coarse_px=warp_coarse_px,
+            trim_to_mts=trim_to_mts,
+            mt_pad_frac=mt_pad_frac,
+            progress=lambda m, fr: log(f"  export: {m} ({fr * 100:.0f}%)"),
+        )
     t_export = time.perf_counter() - t
 
     total = time.perf_counter() - t0

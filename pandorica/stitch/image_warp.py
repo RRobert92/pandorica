@@ -144,7 +144,7 @@ def image_residual_warps(
     poses: Sequence[Pose],
     mt_warps: Optional[Sequence] = None,
     *,
-    method: str = "mi",
+    method: str = "ncc",
     n_slices: int = 10,
     proj_downscale: int = 4,
     invert_z: bool = False,
@@ -166,7 +166,9 @@ def image_residual_warps(
     region. The residual shifts, plus the MT endpoints pinned to zero (so the fill
     vanishes at the MTs), are fit to a guarded TPS. Too few matches → identity.
 
-    :param method: ``'mi'`` / ``'grad'`` / ``'ncc'`` matching metric.
+    :param method: ``'ncc'`` (default, cv2 FFT, fast), ``'grad'`` (NCC on edge
+        maps), ``'mi'`` (mutual information; ~2× slower, helps only for
+        cross-modality / contrast-mismatched faces).
     :param mt_warps: MT warps to pre-align before matching (``None`` = image-only).
     :param workers: processes for cell matching (memory-safe — faces are small).
     :param omega_max: vorticity bound for the guarded fit (same softness knob).

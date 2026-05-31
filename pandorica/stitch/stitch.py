@@ -31,10 +31,6 @@ from pandorica.stitch.transform.solver import (
     apply_pose,
     invert_pose,
 )
-from pandorica.stitch.transform.applier import (
-    make_inverse_map,
-    warp_volume_slicewise,
-)
 from pandorica.stitch.geometry import pose_to_pixel
 from pandorica.stitch.dataset import Dataset
 
@@ -221,6 +217,10 @@ def _warp_volume_zblend(
     interface's half-residual and the deformation interpolates between them
     through Z, instead of one warp applied uniformly across the section.
 
+    When ``b_grid is t_grid`` (same object — the uniform-warp regime used by
+    the ``warp_zblend=False`` export path), the per-slice ``disp`` and ``src``
+    are constant in Z and are computed once outside the loop.
+
     :param inv_pose: inverse of the section's absolute (pixel, canvas-offset) pose.
     :param out_pts: ``[M, 2]`` output-grid ``(x, y)`` points (M = Hc*Wc).
     :param b_grid / t_grid: ``[M, 2]`` displacements at the bottom / top face.
@@ -228,11 +228,16 @@ def _warp_volume_zblend(
     z = volume.shape[0]
     hc, wc = out_hw
     out = np.empty((z, hc, wc), dtype=dtype)
+    uniform = b_grid is t_grid
+    if uniform:
+        src = apply_pose(inv_pose, out_pts - b_grid)
+        coords = np.vstack([src[:, 1], src[:, 0]])
     for k in range(z):
-        a = 1.0 - (k / (z - 1)) if z > 1 else 1.0  # 1 at bottom (k=0) -> 0 at top
-        disp = a * b_grid + (1.0 - a) * t_grid
-        src = apply_pose(inv_pose, out_pts - disp)  # input (x, y)
-        coords = np.vstack([src[:, 1], src[:, 0]])  # map_coordinates wants (row, col)
+        if not uniform:
+            a = 1.0 - (k / (z - 1)) if z > 1 else 1.0  # 1 at bottom (k=0) -> 0 at top
+            disp = a * b_grid + (1.0 - a) * t_grid
+            src = apply_pose(inv_pose, out_pts - disp)  # input (x, y)
+            coords = np.vstack([src[:, 1], src[:, 0]])  # map_coordinates wants (row, col)
         out[k] = (
             map_coordinates(volume[k], coords, order=1, mode="constant", cval=0.0)
             .reshape(hc, wc)
@@ -469,13 +474,14 @@ def export_stitched(
             fp["Ty"] += float(offset[1])
             return fp
 
-        out_pts = None
-        if n_iface and warp_zblend:
-            yy, xx = np.meshgrid(np.arange(hc), np.arange(wc), indexing="ij")
-            # float32: these are (Hc·Wc, 2) canvas grids — the dominant non-volume
-            # buffer — and the GPU warp casts them to float32 anyway. Canvas pixel
-            # coords are exact in float32, so no precision loss.
-            out_pts = np.column_stack([xx.ravel(), yy.ravel()]).astype(np.float32)
+        # Canvas grid is needed by every warp path (zblend OR uniform; GPU OR CPU)
+        # because both _warp_volume_zblend and warp_volume_torch consume out_pts
+        # alongside b_grid / t_grid. float32: ~(Hc·Wc·8) bytes — the dominant
+        # non-volume buffer — and the GPU warp casts to float32 anyway. Canvas
+        # pixel coords are exact in float32, so no precision loss.
+        yy, xx = np.meshgrid(np.arange(hc), np.arange(wc), indexing="ij")
+        out_pts = np.column_stack([xx.ravel(), yy.ravel()]).astype(np.float32)
+        _zero_grid = np.zeros_like(out_pts)
 
         gpu_device = None
         effective_chunk = int(gpu_chunk) if gpu_chunk is not None else 4
@@ -518,7 +524,17 @@ def export_stitched(
             # keeps its pages resident). Assembled into the .am by to_am_streamed.
             tf = join(output_dir, f"_tmp_sec{i:02d}.dat")
             with open(tf, "wb") as fout:
-                if n_iface and warp_zblend:
+                # Build (b_grid, t_grid) for this section. Two regimes:
+                #   * warp_zblend: bottom face carries +½·W[i-1] (its own interface),
+                #     top face carries -½·W[i] (the next interface). The k-blend in
+                #     _warp_volume_zblend / warp_volume_torch then linearly varies
+                #     between them through Z.
+                #   * uniform (warp_zblend=False): only the lower interface (W[i-1])
+                #     applies to this section, identically at every Z. b_grid ==
+                #     t_grid collapses the linear blend to a constant — same math
+                #     as the old make_inverse_map(pose, warp=vw) path, but evaluated
+                #     on the coarse grid and warped on the GPU when available.
+                if warp_zblend:
                     b_grid = (
                         (
                             0.5
@@ -530,7 +546,7 @@ def export_stitched(
                             )
                         ).astype(np.float32)
                         if wb is not None
-                        else np.zeros_like(out_pts)
+                        else _zero_grid
                     )
                     t_grid = (
                         (
@@ -543,49 +559,50 @@ def export_stitched(
                             )
                         ).astype(np.float32)
                         if wt is not None
-                        else np.zeros_like(out_pts)
-                    )
-                    inv_i = invert_pose(_frame_off(i))
-                    if use_gpu and gpu_device not in (None, "cpu"):
-                        from pandorica.stitch import accel as _accel
-
-                        _accel.warp_volume_torch(
-                            vol,
-                            inv_i,
-                            (hc, wc),
-                            out_pts,
-                            b_grid,
-                            t_grid,
-                            device=gpu_device,
-                            chunk=effective_chunk,
-                            out=fout,
-                        )
-                    else:
-                        warped = _warp_volume_zblend(
-                            vol, inv_i, (hc, wc), out_pts, b_grid, t_grid
-                        )
-                        fout.write(np.ascontiguousarray(warped).tobytes())
-                    tag = (
-                        (
-                            "  (+Zblend/GPU)"
-                            if use_gpu and gpu_device not in (None, "cpu")
-                            else "  (+Zblend)"
-                        )
-                        if (wb is not None or wt is not None)
-                        else ""
+                        else _zero_grid
                     )
                 else:
-                    vw = (
-                        _FramedWarp(wb, _frame_off(i - 1), px)
+                    b_grid = (
+                        _displacement_grid_coarse(
+                            _FramedWarp(wb, _frame_off(i - 1), px),
+                            (hc, wc),
+                            out_pts,
+                            coarse_px=warp_coarse_px,
+                        ).astype(np.float32)
                         if wb is not None
-                        else None
+                        else _zero_grid
                     )
-                    inv = make_inverse_map(_frame_off(i), warp=vw)
-                    warped = warp_volume_slicewise(
-                        vol, inv, out_hw=(hc, wc), dtype=np.uint8
+                    t_grid = b_grid
+
+                inv_i = invert_pose(_frame_off(i))
+                if use_gpu and gpu_device not in (None, "cpu"):
+                    from pandorica.stitch import accel as _accel
+
+                    _accel.warp_volume_torch(
+                        vol,
+                        inv_i,
+                        (hc, wc),
+                        out_pts,
+                        b_grid,
+                        t_grid,
+                        device=gpu_device,
+                        chunk=effective_chunk,
+                        out=fout,
+                    )
+                else:
+                    warped = _warp_volume_zblend(
+                        vol, inv_i, (hc, wc), out_pts, b_grid, t_grid
                     )
                     fout.write(np.ascontiguousarray(warped).tobytes())
-                    tag = "  (+TPS)" if vw is not None else ""
+
+                has_warp = wb is not None or (warp_zblend and wt is not None)
+                on_gpu = use_gpu and gpu_device not in (None, "cpu")
+                if not has_warp:
+                    tag = "  (+GPU)" if on_gpu else ""
+                elif warp_zblend:
+                    tag = "  (+Zblend/GPU)" if on_gpu else "  (+Zblend)"
+                else:
+                    tag = "  (+TPS/GPU)" if on_gpu else "  (+TPS)"
             z = vol.shape[0]
             s.drop_volume()
             temp.append((tf, z))

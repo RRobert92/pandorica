@@ -15,9 +15,11 @@ napari dock widgets for the stitch validator + coarse-GT recorder.
 * :class:`StitchValidatorWidget` — load a dataset, run the stitch, overlay raw
   vs. aligned microtubules (and aligned volumes), read the per-interface QC, and
   export the stitched volume + microtubules.
-* :class:`CoarseGTWidget` — per-interface manual coarse alignment: rotate (slider)
-  and translate (spinbox or mouse-drag) the moving bottom-face onto the fixed
-  top-face and save ``{angle, tx, ty}`` per interface to ``coarse_gt.json``.
+* :class:`CoarseGTWidget` — per-interface manual coarse alignment: rotate (slider),
+  translate (spinbox or mouse-drag), and anisotropic scale (Sx, Sy sliders) of
+  the moving bottom-face onto the fixed top-face. Saves ``{angle, tx, ty, sx,
+  sy, scale}`` per interface to ``coarse_gt.json``. Older files without
+  ``sx``/``sy`` load with the legacy isotropic ``scale`` value.
 
 UI only — all loading/stitching/IO lives in :mod:`._io`, :mod:`._stitch`,
 :mod:`._geometry`.
@@ -30,7 +32,7 @@ from os.path import join
 from typing import Dict, List, Optional
 
 import numpy as np
-from qtpy.QtCore import Qt
+from qtpy.QtCore import QObject, QThread, Qt, Signal
 from qtpy.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -42,6 +44,7 @@ from qtpy.QtWidgets import (
     QApplication,
     QLabel,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSlider,
     QSpinBox,
@@ -86,15 +89,26 @@ class StitchValidatorWidget(QWidget):
         self.folder_lbl.setWordWrap(True)
         browse = QPushButton("Browse folder…")
         browse.clicked.connect(self._browse)
+        # New: load individual .am files (volumes + spatialGraph) directly —
+        # tardis-style file picking when the user doesn't want to drop them
+        # into a folder first.
+        browse_files = QPushButton("Browse files…")
+        browse_files.clicked.connect(self._browse_files)
         self.load_volumes_cb = QCheckBox("Load volumes (large)")
         self.display_ds = QSpinBox()
         self.display_ds.setRange(1, 32)
         self.display_ds.setValue(4)
+        # New: render spatial graphs as connected polylines (splines) instead of
+        # unstructured points. Default ON — matches the tardis-style display.
+        self.splines_cb = QCheckBox("Render spatial graphs as splines")
+        self.splines_cb.setChecked(True)
         load_btn = QPushButton("Load dataset")
         load_btn.clicked.connect(self._load)
         f.addRow(browse, self.folder_lbl)
+        f.addRow(browse_files)
         f.addRow("Display downscale", self.display_ds)
         f.addRow(self.load_volumes_cb)
+        f.addRow(self.splines_cb)
         f.addRow(load_btn)
         layout.addWidget(box)
 
@@ -173,6 +187,24 @@ class StitchValidatorWidget(QWidget):
         if d:
             self.folder_lbl.setText(d)
 
+    def _browse_files(self) -> None:
+        """Pick individual .am files (volumes + spatial graphs); load directly."""
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select AmiraMesh files (volumes + *_spatialGraph.am)",
+            "",
+            "AmiraMesh (*.am);;All files (*)",
+        )
+        if not files:
+            return
+        try:
+            self.dataset = self._dataset_from_files(files)
+        except Exception as e:  # noqa: BLE001
+            self._error("Load failed", e)
+            return
+        self.folder_lbl.setText(f"({len(files)} files selected)")
+        self._after_load()
+
     def _load(self) -> None:
         folder = self.folder_lbl.text()
         if not os.path.isdir(folder):
@@ -183,6 +215,10 @@ class StitchValidatorWidget(QWidget):
         except Exception as e:  # noqa: BLE001
             self._error("Load failed", e)
             return
+        self._after_load()
+
+    def _after_load(self) -> None:
+        """Common post-load wiring (used by both folder and file pickers)."""
         self.poses = None
         self.result = None
         self._clear_layers()
@@ -194,6 +230,90 @@ class StitchValidatorWidget(QWidget):
             f"Loaded {len(self.dataset)} sections: {names}\nRun stitch to align."
         )
         self.viewer.reset_view()
+
+    def _dataset_from_files(self, paths) -> Dataset:
+        """Build a Dataset from a list of individual .am files.
+
+        Classifies each file by header content (matching :func:`sort_tomogram_files`'s
+        rules: ``Lattice`` → image volume; ``VERTEX`` / ``EDGE`` /
+        ``HxSpatialGraph`` → spatial graph). Pairs them by filename-stem
+        containment — the graph stem must contain the image stem (or vice
+        versa) for them to pair. Unpaired graphs become graph-only sections;
+        unpaired volumes become volume-only sections.
+        """
+        from pandorica.io.amira import read_segmented_points
+        from pandorica.stitch.dataset import Section, _derive_names, _stem
+
+        image_paths: list = []
+        coord_paths: list = []
+        for p in paths:
+            try:
+                with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                    head = f.read(8192)
+            except OSError:
+                continue
+            if "Lattice" in head:
+                image_paths.append(p)
+            elif (
+                "VERTEX" in head
+                or "EDGE" in head
+                or "HxSpatialGraph" in head
+                or p.endswith("_spatialGraph.am")
+            ):
+                coord_paths.append(p)
+            else:
+                # Default: non-lattice .am with no graph markers → assume image
+                image_paths.append(p)
+
+        # Pair by stem containment (graph stem contains image stem, or symmetric).
+        def stem(p: str) -> str:
+            return os.path.splitext(os.path.basename(p))[0]
+
+        used_coords: set = set()
+        pairs: list = []
+        for img in sorted(image_paths):
+            img_stem = stem(img)
+            match = None
+            for c in coord_paths:
+                if c in used_coords:
+                    continue
+                c_stem = stem(c).replace("_spatialGraph", "")
+                if c_stem == img_stem or c_stem in img_stem or img_stem in c_stem:
+                    match = c
+                    break
+            if match:
+                used_coords.add(match)
+            pairs.append((img, match))
+        # Orphan graphs become graph-only sections (no volume).
+        for c in sorted(coord_paths):
+            if c not in used_coords:
+                pairs.append((None, c))
+
+        if not pairs:
+            raise ValueError("No .am files classified as volume or spatial graph.")
+
+        names = _derive_names(
+            [_stem(coord or img, i) for i, (img, coord) in enumerate(pairs)]
+        )
+        sections: list = []
+        for i, (img, coord) in enumerate(pairs):
+            coords = np.empty((0, 4))
+            if coord is not None:
+                try:
+                    c = read_segmented_points(coord)
+                    if c is not None and len(c):
+                        coords = np.asarray(c, dtype=float)
+                except Exception:  # noqa: BLE001
+                    pass
+            sections.append(
+                Section(
+                    name=names[i], index=i, image_path=img, coord_path=coord,
+                    coords=coords,
+                )
+            )
+        # Use the first file's directory as the dataset folder (informational).
+        folder = os.path.dirname(paths[0]) if paths else ""
+        return Dataset(folder=folder, sections=sections)
 
     def _run(self) -> None:
         if self.dataset is None:
@@ -286,21 +406,37 @@ class StitchValidatorWidget(QWidget):
                 self.viewer.layers.remove(lyr)
 
     def _draw_sections(self, coords_list, prefix: str, aligned: bool) -> None:
+        """Dispatch on the splines checkbox: render as paths or as points."""
         self._clear_layers(prefixes=(prefix,))
+        as_splines = self.splines_cb.isChecked()
         for i, c in enumerate(coords_list):
-            pts = npg.coords_to_points_zyx(c)
-            if len(pts) == 0:
-                continue
             color = npg.section_color(i)
-            self.viewer.add_points(
-                pts,
-                name=f"{prefix}:{self.dataset.names[i]}",
-                size=max(np.ptp(pts[:, 1:]) / 200.0, 1.0) if len(pts) else 1.0,
-                face_color=color,
-                border_color=color,
-                opacity=0.9 if aligned else 0.35,
-                visible=aligned,  # show aligned by default, hide raw until toggled
-            )
+            if as_splines:
+                paths = npg.coords_to_paths_zyx(c)
+                if not paths:
+                    continue
+                self.viewer.add_shapes(
+                    paths,
+                    shape_type="path",
+                    name=f"{prefix}:{self.dataset.names[i]}",
+                    edge_color=color,
+                    edge_width=2.0,
+                    opacity=0.9 if aligned else 0.55,
+                    visible=aligned,
+                )
+            else:
+                pts = npg.coords_to_points_zyx(c)
+                if len(pts) == 0:
+                    continue
+                self.viewer.add_points(
+                    pts,
+                    name=f"{prefix}:{self.dataset.names[i]}",
+                    size=max(np.ptp(pts[:, 1:]) / 200.0, 1.0) if len(pts) else 1.0,
+                    face_color=color,
+                    border_color=color,
+                    opacity=0.9 if aligned else 0.35,
+                    visible=aligned,
+                )
 
     def _draw_volumes(self, aligned: bool) -> None:
         self._clear_layers(prefixes=("vol",))
@@ -368,6 +504,51 @@ class StitchValidatorWidget(QWidget):
 # =========================================================================== #
 #  Coarse ground-truth recorder
 # =========================================================================== #
+class _PrefillWorker(QObject):
+    """Background worker: runs the CPD-based hybrid coarse search per interface.
+
+    Emits ``progress(k_done, n_total, raw_angle)`` after each interface so the
+    UI can stream estimates in as they land (the operator gets the *current*
+    interface's prefill as soon as that one finishes, rather than waiting for
+    the whole stack). ``finished(angles)`` carries the final A–P-fused /
+    continuity-resolved per-interface angles after the full pass; the per-step
+    raw angles are an early approximation and may be revised by the final pass.
+    """
+
+    progress = Signal(int, int, float)
+    finished = Signal(list)
+    failed = Signal(str)
+
+    def __init__(self, coords_list: List[np.ndarray]):
+        super().__init__()
+        self._coords = coords_list
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:
+        try:
+            from pandorica.stitch.coarse.coarse_hybrid import hybrid_coarse
+
+            def _cb(k: int, n: int, angle: float) -> None:
+                # Best-effort cancellation: stop after the current interface
+                # finishes (CPD itself is not interruptible mid-fit).
+                if self._stop:
+                    raise StopIteration
+                self.progress.emit(k, n, angle)
+
+            res = hybrid_coarse(
+                self._coords, search_kwargs={"use_cpd": True}, progress=_cb
+            )
+            if not self._stop:
+                self.finished.emit(list(res.angles))
+        except StopIteration:
+            self.finished.emit([])  # cancelled
+        except Exception as e:  # noqa: BLE001
+            self.failed.emit(f"{e}\n{traceback.format_exc()}")
+
+
 class CoarseGTWidget(QWidget):
     """Per-interface manual coarse alignment → ``coarse_gt.json``."""
 
@@ -381,7 +562,12 @@ class CoarseGTWidget(QWidget):
         self._moving = None  # moving bottom-face endpoints (xy), un-posed
         self._center = np.zeros(2)
         self._grab = False
-        self._hybrid_angles = None
+        # Prefill state. ``_hybrid_angles`` is the running per-interface estimate;
+        # entries are filled in as the worker streams `progress` signals, and the
+        # final A–P-fused / continuity-resolved values overwrite them on finish.
+        self._hybrid_angles: Optional[List[Optional[float]]] = None
+        self._prefill_thread: Optional[QThread] = None
+        self._prefill_worker: Optional[_PrefillWorker] = None
         self._proj: Dict[int, tuple] = (
             {}
         )  # section index -> (top_maxproj, bottom_maxproj)
@@ -439,21 +625,75 @@ class CoarseGTWidget(QWidget):
         th.addWidget(self.ty_spin)
         il.addLayout(th)
 
+        # Anisotropic scale: Sx and Sy independently, with a "Lock aspect" toggle
+        # that mirrors one to the other (the common isotropic case stays a one-knob
+        # experience). Real motivation is knife compression in plastic sections —
+        # typically ~5-15% along the cutting axis, so Sx ≠ Sy is biologically
+        # meaningful, not just a UI nicety. Sliders work in integer percent
+        # (50..200 = 0.5..2.0); spinboxes carry the precise float.
+        self.scale_lock_cb = QCheckBox("Lock aspect (isotropic scale)")
+        self.scale_lock_cb.setChecked(True)
+        # No explicit handler: the per-axis _on_sx/sy_changed slots read the
+        # checkbox each time and mirror when checked.
+        il.addWidget(self.scale_lock_cb)
+
+        sxh = QHBoxLayout()
+        self.sx_slider = QSlider(Qt.Horizontal)
+        self.sx_slider.setRange(50, 200)
+        self.sx_slider.setValue(100)
+        self.sx_slider.valueChanged.connect(self._sx_from_slider)
+        self.sx_spin = QDoubleSpinBox()
+        self.sx_spin.setRange(0.5, 2.0)
+        self.sx_spin.setSingleStep(0.01)
+        self.sx_spin.setDecimals(3)
+        self.sx_spin.setValue(1.0)
+        self.sx_spin.valueChanged.connect(self._on_sx_changed)
+        sxh.addWidget(QLabel("sx"))
+        sxh.addWidget(self.sx_slider)
+        sxh.addWidget(self.sx_spin)
+        il.addLayout(sxh)
+
+        syh = QHBoxLayout()
+        self.sy_slider = QSlider(Qt.Horizontal)
+        self.sy_slider.setRange(50, 200)
+        self.sy_slider.setValue(100)
+        self.sy_slider.valueChanged.connect(self._sy_from_slider)
+        self.sy_spin = QDoubleSpinBox()
+        self.sy_spin.setRange(0.5, 2.0)
+        self.sy_spin.setSingleStep(0.01)
+        self.sy_spin.setDecimals(3)
+        self.sy_spin.setValue(1.0)
+        self.sy_spin.valueChanged.connect(self._on_sy_changed)
+        syh.addWidget(QLabel("sy"))
+        syh.addWidget(self.sy_slider)
+        syh.addWidget(self.sy_spin)
+        il.addLayout(syh)
+
         self.grab_cb = QCheckBox("Grab: drag in canvas to translate moving face")
         self.grab_cb.toggled.connect(self._set_grab)
         il.addWidget(self.grab_cb)
 
         hh = QHBoxLayout()
-        prefill = QPushButton("Prefill from auto coarse")
-        prefill.clicked.connect(self._prefill_hybrid)
+        self.prefill_btn = QPushButton("Prefill from auto coarse")
+        self.prefill_btn.clicked.connect(self._prefill_hybrid)
         reset = QPushButton("Reset")
         reset.clicked.connect(self._reset_controls)
         save = QPushButton("Save GT for interface")
         save.clicked.connect(self._save_interface)
-        hh.addWidget(prefill)
+        hh.addWidget(self.prefill_btn)
         hh.addWidget(reset)
         hh.addWidget(save)
         il.addLayout(hh)
+
+        # Prefill progress (hidden until a CPD run is in flight). The Prefill
+        # button stays usable so the operator can re-trigger the current
+        # interface's spinbox once its angle has streamed in.
+        self.prefill_progress = QProgressBar()
+        self.prefill_progress.setRange(0, 1)
+        self.prefill_progress.setValue(0)
+        self.prefill_progress.setFormat("auto coarse: %v / %m  (%p%)")
+        self.prefill_progress.setVisible(False)
+        il.addWidget(self.prefill_progress)
         layout.addWidget(ibox)
 
         # boundary-face image overlay (Z-max projections of the touching faces)
@@ -496,6 +736,9 @@ class CoarseGTWidget(QWidget):
         except Exception as e:  # noqa: BLE001
             self._log(f"Load failed: {e}")
             return
+        # New dataset → discard any in-flight or cached auto-coarse from the
+        # previous one (interface counts and section identities won't match).
+        self._cancel_prefill()
         self._hybrid_angles = None
         self.gt = self._read_gt()
         self.iface_combo.blockSignals(True)
@@ -533,10 +776,17 @@ class CoarseGTWidget(QWidget):
                 face_color="#7fb3ff",
                 border_color="#1f6fff",
             )
-        # restore stored / zeroed controls, then draw moving
+        # restore stored / zeroed controls, then draw moving.
+        # Backward-compat: old GT JSONs only have "scale" (isotropic); read sx/sy
+        # when present, else fall back to the legacy single scale, else 1.0.
         rec = self.gt.get(self.dataset.interface_label(k), {})
+        legacy = rec.get("scale", 1.0)
         self._set_controls(
-            rec.get("angle", 0.0), rec.get("tx", 0.0), rec.get("ty", 0.0)
+            rec.get("angle", 0.0),
+            rec.get("tx", 0.0),
+            rec.get("ty", 0.0),
+            rec.get("sx", legacy),
+            rec.get("sy", legacy),
         )
         self.viewer.dims.ndisplay = 2
         self.viewer.reset_view()
@@ -545,21 +795,24 @@ class CoarseGTWidget(QWidget):
     def _posed_moving(self) -> np.ndarray:
         if self._moving is None or len(self._moving) == 0:
             return np.empty((0, 2))
-        pose = geo.centroid_pose(
+        return npg.apply_anisotropic_xy(
+            self._moving,
             self.angle_spin.value(),
             self.tx_spin.value(),
             self.ty_spin.value(),
+            self.sx_spin.value(),
+            self.sy_spin.value(),
             self._center,
         )
-        from pandorica.stitch.transform.solver import apply_pose
 
-        return apply_pose(pose, self._moving)
-
-    def _current_pose(self):
-        return geo.centroid_pose(
+    def _current_affine_2d(self) -> np.ndarray:
+        """Napari 3×3 affine (y, x order) reflecting the current control values."""
+        return npg.napari_affine_2d_anisotropic(
             self.angle_spin.value(),
             self.tx_spin.value(),
             self.ty_spin.value(),
+            self.sx_spin.value(),
+            self.sy_spin.value(),
             self._center,
         )
 
@@ -578,11 +831,9 @@ class CoarseGTWidget(QWidget):
                 border_color="#d4691a",
                 symbol="x",
             )
-        # drive the moving boundary-face image with the same pose (no resampling)
+        # drive the moving boundary-face image with the same transform (no resampling)
         if "gt:img-moving" in self.viewer.layers:
-            self.viewer.layers["gt:img-moving"].affine = npg.napari_affine_2d(
-                self._current_pose()
-            )
+            self.viewer.layers["gt:img-moving"].affine = self._current_affine_2d()
 
     # ---- boundary-face image overlay ------------------------------------- #
     def _load_projections(self) -> None:
@@ -651,7 +902,7 @@ class CoarseGTWidget(QWidget):
                 colormap="bop orange",
                 blending="additive",
                 opacity=0.9,
-                affine=npg.napari_affine_2d(self._current_pose()),
+                affine=self._current_affine_2d(),
             )
 
     # ---- control wiring -------------------------------------------------- #
@@ -659,28 +910,93 @@ class CoarseGTWidget(QWidget):
         if abs(self.angle_spin.value() - v) > 0.5:
             self.angle_spin.setValue(float(v))  # triggers refresh
 
+    def _sx_from_slider(self, v: int) -> None:
+        """Slider holds 100·sx (integer percent); push to spinbox if changed enough."""
+        s = v / 100.0
+        if abs(self.sx_spin.value() - s) > 0.005:
+            self.sx_spin.setValue(s)  # triggers _on_sx_changed
+
+    def _sy_from_slider(self, v: int) -> None:
+        s = v / 100.0
+        if abs(self.sy_spin.value() - s) > 0.005:
+            self.sy_spin.setValue(s)
+
+    def _on_sx_changed(self, *_):
+        """Mirror to sy when 'Lock aspect' is on, then trigger a redraw."""
+        if self.scale_lock_cb.isChecked():
+            v = self.sx_spin.value()
+            self.sy_spin.blockSignals(True)
+            self.sy_slider.blockSignals(True)
+            self.sy_spin.setValue(v)
+            self.sy_slider.setValue(int(round(v * 100)))
+            self.sy_spin.blockSignals(False)
+            self.sy_slider.blockSignals(False)
+        self._refresh_from_controls()
+
+    def _on_sy_changed(self, *_):
+        if self.scale_lock_cb.isChecked():
+            v = self.sy_spin.value()
+            self.sx_spin.blockSignals(True)
+            self.sx_slider.blockSignals(True)
+            self.sx_spin.setValue(v)
+            self.sx_slider.setValue(int(round(v * 100)))
+            self.sx_spin.blockSignals(False)
+            self.sx_slider.blockSignals(False)
+        self._refresh_from_controls()
+
     def _refresh_from_controls(self, *_):
+        # Sync the integer sliders to their float spinboxes (one-way: spin → slider).
         a = self.angle_spin.value()
         if self.angle_slider.value() != int(round(a)):
             self.angle_slider.blockSignals(True)
             self.angle_slider.setValue(int(round(a)))
             self.angle_slider.blockSignals(False)
+        for spin, slider in (
+            (self.sx_spin, self.sx_slider),
+            (self.sy_spin, self.sy_slider),
+        ):
+            s_pct = int(round(spin.value() * 100))
+            if slider.value() != s_pct:
+                slider.blockSignals(True)
+                slider.setValue(s_pct)
+                slider.blockSignals(False)
         self._refresh_moving()
         self._log_interface()
 
-    def _set_controls(self, angle: float, tx: float, ty: float) -> None:
-        for w in (self.angle_spin, self.tx_spin, self.ty_spin, self.angle_slider):
+    def _set_controls(
+        self,
+        angle: float,
+        tx: float,
+        ty: float,
+        sx: float = 1.0,
+        sy: float = 1.0,
+    ) -> None:
+        controls = (
+            self.angle_spin,
+            self.tx_spin,
+            self.ty_spin,
+            self.angle_slider,
+            self.sx_spin,
+            self.sx_slider,
+            self.sy_spin,
+            self.sy_slider,
+        )
+        for w in controls:
             w.blockSignals(True)
         self.angle_spin.setValue(float(angle))
         self.angle_slider.setValue(int(round(angle)))
         self.tx_spin.setValue(float(tx))
         self.ty_spin.setValue(float(ty))
-        for w in (self.angle_spin, self.tx_spin, self.ty_spin, self.angle_slider):
+        self.sx_spin.setValue(float(sx))
+        self.sx_slider.setValue(int(round(sx * 100)))
+        self.sy_spin.setValue(float(sy))
+        self.sy_slider.setValue(int(round(sy * 100)))
+        for w in controls:
             w.blockSignals(False)
         self._refresh_moving()
 
     def _reset_controls(self) -> None:
-        self._set_controls(0.0, 0.0, 0.0)
+        self._set_controls(0.0, 0.0, 0.0, 1.0, 1.0)
         self._log_interface()
 
     def _set_grab(self, on: bool) -> None:
@@ -712,32 +1028,114 @@ class CoarseGTWidget(QWidget):
 
     # ---- auto-coarse prefill --------------------------------------------- #
     def _prefill_hybrid(self) -> None:
+        """Prefill the current interface's angle from the auto coarse search.
+
+        On large stacks the CPD-based search takes minutes, so it runs in a
+        background ``QThread`` (:class:`_PrefillWorker`). The UI stays
+        responsive: the operator can keep manually aligning while estimates
+        stream in. The current interface's spinbox auto-updates the moment its
+        estimate arrives, and any later interface gets the same treatment when
+        the operator navigates to it.
+        """
         if self.dataset is None:
             return
-        if self._hybrid_angles is None:
-            # Use the CPD multi-seed search — it is the pipeline's default
-            # (cpd_coarse=True) AND ~20× faster than the gated sweep here.
-            self._log("Computing auto coarse (CPD, one-time)…")
-            QApplication.processEvents()
-            try:
-                from pandorica.stitch.coarse.coarse_hybrid import (
-                    hybrid_coarse,
-                )
-
-                self._hybrid_angles = hybrid_coarse(
-                    self.dataset.coords_list(),
-                    search_kwargs={"use_cpd": True},
-                ).angles
-            except Exception as e:  # noqa: BLE001
-                self._log(f"Hybrid coarse failed: {e}")
-                return
-        if self.k < len(self._hybrid_angles):
-            self._set_controls(
-                float(self._hybrid_angles[self.k]),
-                self.tx_spin.value(),
-                self.ty_spin.value(),
+        # Already-computed angles → instant fill, no recompute.
+        if (
+            self._hybrid_angles is not None
+            and self.k < len(self._hybrid_angles)
+            and self._hybrid_angles[self.k] is not None
+        ):
+            self._apply_prefill(self.k, float(self._hybrid_angles[self.k]))
+            return
+        # A computation is already in flight; just wait for it.
+        if self._prefill_thread is not None and self._prefill_thread.isRunning():
+            self._log(
+                "Auto coarse already running — the current interface will fill "
+                "the moment its estimate arrives. You can keep aligning others."
             )
-            self._log_interface()
+            return
+        # Cold start: spin up a worker.
+        n_iface = max(0, len(self.dataset) - 1)
+        if n_iface == 0:
+            return
+        self._hybrid_angles = [None] * n_iface
+        self.prefill_progress.setRange(0, n_iface)
+        self.prefill_progress.setValue(0)
+        self.prefill_progress.setVisible(True)
+
+        thread = QThread(self)
+        worker = _PrefillWorker(self.dataset.coords_list())
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_prefill_progress)
+        worker.finished.connect(self._on_prefill_finished)
+        worker.failed.connect(self._on_prefill_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._prefill_thread = thread
+        self._prefill_worker = worker
+        self._log("Auto coarse: starting CPD search in background…")
+        thread.start()
+
+    def _on_prefill_progress(self, k: int, n: int, angle: float) -> None:
+        """Streamed: interface ``k`` of ``n`` just finished its raw estimate."""
+        if self._hybrid_angles is None or k >= len(self._hybrid_angles):
+            return
+        self._hybrid_angles[k] = float(angle)
+        self.prefill_progress.setValue(k + 1)
+        if k == self.k:
+            # Operator is sitting on this interface — fill its spinbox now.
+            self._apply_prefill(k, float(angle))
+        else:
+            self._log(
+                f"Auto coarse: interface {k + 1}/{n} ready "
+                f"(raw angle {angle:+.2f}°). Move to it to fill its spinbox."
+            )
+
+    def _on_prefill_finished(self, angles) -> None:
+        """Full pass complete — overwrite raw estimates with A–P-fused / continuity-resolved angles."""
+        self.prefill_progress.setVisible(False)
+        if not angles:
+            self._log("Auto coarse: cancelled.")
+            return
+        self._hybrid_angles = [float(a) for a in angles]
+        # If the operator's still on an interface we've already filled, re-apply
+        # the final (resolved) value in case the continuity pass changed it.
+        if self.k < len(self._hybrid_angles):
+            self._apply_prefill(self.k, float(self._hybrid_angles[self.k]))
+        self._log(f"Auto coarse: done ({len(angles)} interface(s)).")
+
+    def _on_prefill_failed(self, msg: str) -> None:
+        self.prefill_progress.setVisible(False)
+        self._hybrid_angles = None
+        self._log(f"Auto coarse failed:\n{msg}")
+
+    def _apply_prefill(self, k: int, angle: float) -> None:
+        """Push a computed angle into the spinbox without touching tx/ty/sx/sy."""
+        if k != self.k:
+            return
+        self._set_controls(
+            angle,
+            self.tx_spin.value(),
+            self.ty_spin.value(),
+            self.sx_spin.value(),
+            self.sy_spin.value(),
+        )
+        self._log_interface()
+
+    def _cancel_prefill(self) -> None:
+        """Stop any in-flight prefill worker. Best-effort: CPD is not interruptible
+        mid-fit, so we stop at the next interface boundary."""
+        if self._prefill_worker is not None:
+            self._prefill_worker.stop()
+        if self._prefill_thread is not None and self._prefill_thread.isRunning():
+            self._prefill_thread.quit()
+            self._prefill_thread.wait(2000)
+        self._prefill_thread = None
+        self._prefill_worker = None
+        self.prefill_progress.setVisible(False)
 
     # ---- save ------------------------------------------------------------ #
     def _gt_path(self) -> str:
@@ -757,10 +1155,17 @@ class CoarseGTWidget(QWidget):
         if self.dataset is None:
             return
         label = self.dataset.interface_label(self.k)
+        sx = self.sx_spin.value()
+        sy = self.sy_spin.value()
+        # "scale" stays in the JSON as the isotropic mean for callers that
+        # haven't been updated to read sx/sy; sx/sy are the source of truth.
         self.gt[label] = {
             "angle": round(self.angle_spin.value(), 4),
             "tx": round(self.tx_spin.value(), 3),
             "ty": round(self.ty_spin.value(), 3),
+            "sx": round(sx, 4),
+            "sy": round(sy, 4),
+            "scale": round((sx + sy) / 2.0, 4),
             "n_fixed": int(len(self._fixed)) if self._fixed is not None else 0,
             "n_moving": int(len(self._moving)) if self._moving is not None else 0,
         }
@@ -785,7 +1190,11 @@ class CoarseGTWidget(QWidget):
             return
         label = self.dataset.interface_label(self.k)
         est = ""
-        if self._hybrid_angles is not None and self.k < len(self._hybrid_angles):
+        if (
+            self._hybrid_angles is not None
+            and self.k < len(self._hybrid_angles)
+            and self._hybrid_angles[self.k] is not None
+        ):
             est = f"  | C coarse: {self._hybrid_angles[self.k]:+.1f}°"
         stored = self.gt.get(label)
         self._log(
@@ -793,7 +1202,8 @@ class CoarseGTWidget(QWidget):
             f"  fixed pts={0 if self._fixed is None else len(self._fixed)}  "
             f"moving pts={0 if self._moving is None else len(self._moving)}\n"
             f"  current: angle={self.angle_spin.value():+.2f}°  "
-            f"tx={self.tx_spin.value():.1f}  ty={self.ty_spin.value():.1f}\n"
+            f"tx={self.tx_spin.value():.1f}  ty={self.ty_spin.value():.1f}  "
+            f"sx={self.sx_spin.value():.3f}  sy={self.sy_spin.value():.3f}\n"
             f"  saved:   {stored if stored else '(none)'}"
         )
 
