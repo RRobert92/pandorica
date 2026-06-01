@@ -326,6 +326,9 @@ def export_stitched(
     warp_coarse_px: int = 8,
     trim_to_mts: bool = False,
     mt_pad_frac: float = 0.05,
+    interface_id_pairs: Optional[Sequence] = None,
+    interface_accepted: Optional[Sequence[bool]] = None,
+    chain_split_max_angle_deg: float = 45.0,
 ) -> Dict[str, str]:
     """
     Write a stitched volume + merged microtubule graph under the solved poses.
@@ -372,6 +375,24 @@ def export_stitched(
         that did not opt in).
     :param mt_pad_frac: padding fraction of the MT-bbox span on each axis when
         ``trim_to_mts=True``. ``0.05`` = 5 % context on each side.
+    :param interface_id_pairs: optional per-interface MT correspondences
+        (length ``n-1``). When provided together with ``interface_accepted``,
+        the merged spatial graph chains MTs across accepted joints into single
+        global filaments — so a microtubule crossing four sections appears as
+        one connected spline, not four. Chains break at flagged interfaces.
+        When omitted the legacy per-section id-bump is used (each section's
+        MTs stay independent in the output).
+    :param interface_accepted: parallel ``[n-1]`` booleans (one per interface)
+        telling the chain builder which joints to extend across. Required
+        whenever ``interface_id_pairs`` is given.
+    :param chain_split_max_angle_deg: post-chain joint check — after building
+        chains, every joint is examined and the chain is split there if the
+        OVERALL direction of the sub-block on each side disagrees by more
+        than this angle (deg). Default 45°. A real MT cut and laterally
+        shifted at a section boundary has a sharp local bend but the same
+        overall direction on each side, so it survives this check; two
+        unrelated MTs that got joined will have different overall directions
+        and the chain breaks there.
     :return: dict of written paths (``volume``, ``graph``, ``log`` as available).
     """
     from pandorica.io.amira import (
@@ -628,8 +649,32 @@ def export_stitched(
         offset = np.zeros(2)
 
     # --------------------------- microtubules ---------------------------------
+    # When per-interface id_pairs + accept flags are supplied, build a global
+    # filament-ID map so MTs that physically continue across *accepted*
+    # interfaces become a single connected spline in the output (not one
+    # disjoint spline per section they cross). Chains break at any interface
+    # whose QC did not accept — losing connectivity is the correct response to
+    # an untrustworthy joint. Without those inputs we fall back to the legacy
+    # per-section id-bump (each section's MTs stay independent).
     _tick("merging microtubules", 0.95)
+    use_chain = interface_id_pairs is not None and interface_accepted is not None
+    id_map = None
+    n_filaments = None
+    if use_chain:
+        from pandorica.stitch.chain import chain_filaments
+
+        sections_mt_ids = [
+            ([] if not len(s.coords) else sorted({int(x) for x in s.coords[:, 0]}))
+            for s in dataset.sections
+        ]
+        id_map, n_filaments = chain_filaments(
+            sections_mt_ids,
+            list(interface_id_pairs),
+            [bool(x) for x in interface_accepted],
+        )
+
     merged = []
+    section_idx_per_row: List[np.ndarray] = []
     id_off = 0
     z_off_slices = 0
     for i, s in enumerate(dataset.sections):
@@ -660,19 +705,108 @@ def export_stitched(
             c[:, 1] += float(offset[0]) * px  # canvas offset (px -> Å)
             c[:, 2] += float(offset[1]) * px
             c[:, 3] += z_off_slices * px  # cumulative Z stack (Å)
-            c[:, 0] += id_off
+            if use_chain:
+                local_ids = c[:, 0].astype(int)
+                gids = np.fromiter(
+                    (id_map[(i, int(lid))] for lid in local_ids),
+                    dtype=np.int64,
+                    count=local_ids.size,
+                )
+                c[:, 0] = gids.astype(c.dtype)
+                section_idx_per_row.append(np.full(c.shape[0], i, dtype=np.int64))
+            else:
+                c[:, 0] += id_off
+                id_off = int(c[:, 0].max()) + 1
             merged.append(c)
-            id_off = int(c[:, 0].max()) + 1
         z_off_slices += z_thickness[i]
 
     if merged:
         merged_arr = np.concatenate(merged, axis=0)
+        write_fields: Dict[str, Dict[str, np.ndarray]] = {}
+        # Defined here so the non-chain branch also has access to densify ids
+        # without changing point counts.
+        if use_chain:
+            # Stable-sort by gid (only): preserves the natural section order
+            # for same-gid rows (sections are appended in stack order) AND
+            # the original trace order within each section block. We then
+            # reverse per-section sub-blocks as needed so the chain reads
+            # continuously across joints. **Do NOT sort by Z** — a real MT
+            # bends through 3D space and its Z is not monotonic; Z-sorting
+            # produces zigzags in any non-Z-monotonic spline.
+            # After orientation, a second pass breaks chains at joints where
+            # the OVERALL direction on each side disagrees (the matcher's
+            # filter only sees a coarse 20%-of-MT tangent, so it misses
+            # cases visible only in the final transformed geometry).
+            from pandorica.stitch.chain import (
+                orient_chain_blocks,
+                split_chains_at_joints,
+                compute_chain_labels,
+            )
+
+            sec_arr = np.concatenate(section_idx_per_row, axis=0)
+            order = np.argsort(merged_arr[:, 0].astype(np.int64), kind="stable")
+            merged_arr = merged_arr[order]
+            sec_arr = sec_arr[order]
+            merged_arr = orient_chain_blocks(merged_arr, sec_arr)
+            pre_split_gid = merged_arr[:, 0].astype(np.int64).copy()
+            merged_arr = split_chains_at_joints(
+                merged_arr, sec_arr, max_angle_deg=chain_split_max_angle_deg
+            )
+            # Re-sort by the (possibly new) gids so the writer's same-gid
+            # contiguity rule still holds. Splits assigned fresh ids to
+            # *suffixes* of existing chain blocks, which can leave the
+            # array's gid sequence non-monotonic.
+            order = np.argsort(merged_arr[:, 0].astype(np.int64), kind="stable")
+            merged_arr = merged_arr[order]
+            sec_arr = sec_arr[order]
+            pre_split_gid = pre_split_gid[order]
+            # Drop single-point filaments here (with our tracking arrays in
+            # lockstep) so the writer doesn't drop them again and silently
+            # misalign our per-point / per-edge labels.
+            _ids = merged_arr[:, 0].astype(np.int64)
+            _uniq, _counts = np.unique(_ids, return_counts=True)
+            _keep_ids = set(_uniq[_counts > 1].tolist())
+            _keep_mask = np.fromiter(
+                (int(i) in _keep_ids for i in _ids), dtype=bool, count=_ids.size,
+            )
+            merged_arr = merged_arr[_keep_mask]
+            sec_arr = sec_arr[_keep_mask]
+            pre_split_gid = pre_split_gid[_keep_mask]
+            n_filaments = int(np.unique(merged_arr[:, 0]).size)
+
+            # Diagnostic labels — let the user colour chains by their score
+            # in napari and tell us whether the metric correlates with what
+            # they think is right or wrong.
+            labels = compute_chain_labels(merged_arr, sec_arr, pre_split_gid)
+            write_fields = {
+                "point_int_fields": {
+                    "SectionIdx": labels["point_section_idx"],
+                    "AtJoint": labels["point_at_joint"],
+                },
+                "point_float_fields": {
+                    "JointAngleDeg": labels["point_joint_angle_deg"],
+                    "JointOverallDeg": labels["point_joint_overall_deg"],
+                },
+                "edge_int_fields": {
+                    "ChainLength": labels["edge_chain_length"],
+                    "NJoints": labels["edge_n_joints"],
+                    "WasSplit": labels["edge_was_split"],
+                },
+                "edge_float_fields": {
+                    "MaxJointAngleDeg": labels["edge_max_joint_angle_deg"],
+                    "MaxJointOverallDeg": labels["edge_max_joint_overall_deg"],
+                },
+            }
         graph_path = join(output_dir, "stitched_spatialGraph.am")
-        write_spatial_graph(graph_path, merged_arr)
+        write_spatial_graph(graph_path, merged_arr, **write_fields)
         written["graph"] = graph_path
+        n_units = (
+            n_filaments if use_chain else int(merged_arr[:, 0].max()) + 1
+        )
+        label = "filaments" if use_chain else "MTs"
         log.append(
             f"merged graph: {merged_arr.shape[0]} pts / "
-            f"{int(merged_arr[:, 0].max()) + 1} MTs -> {graph_path}"
+            f"{n_units} {label} -> {graph_path}"
         )
 
     log_path = join(output_dir, "stitch_log.txt")

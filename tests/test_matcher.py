@@ -67,19 +67,52 @@ def test_matches_known_correspondence_under_small_shift():
     rho = 10.0
     # moving = same grid shifted by less than the distance gate
     mov = [_ep(e["id"], e["pos"] + np.array([1.0, 1.0, 0.0]), e["dir"]) for e in ref]
-    matches, ref_xy, mov_xy, conf = mt.match_sections(ref, mov, rho)
+    matches, ref_xy, mov_xy, conf, id_pairs = mt.match_sections(ref, mov, rho)
     assert conf["match_fraction"] == pytest.approx(1.0)
     # every matched pair is the same grid node (ref == mov - shift)
     assert np.allclose(ref_xy, mov_xy - np.array([1.0, 1.0]))
+    # id_pairs parallel to matches: same length, same costs
+    assert len(id_pairs) == len(matches)
 
 
 def test_distance_gate_blocks_far_points():
+    # Disable the physical clamp so this test exercises pure ρ-scaling.
     rho = 1.0
     ref = [_ep(0, (0, 0, 0))]
     mov = [_ep(0, (100, 0, 0))]  # way beyond max_dist_rho * rho
-    matches, ref_xy, _, conf = mt.match_sections(ref, mov, rho, max_dist_rho=5.0)
+    matches, ref_xy, _, conf, _ = mt.match_sections(
+        ref, mov, rho,
+        max_dist_rho=5.0, min_dist_A=0.0, max_dist_A=10.0,
+    )
     assert matches == []
     assert conf["n_matches"] == 0
+
+
+def test_distance_gate_clamps_to_physical_max():
+    # ρ-scaling alone would allow a 5000 Å match (5 × ρ), but the physical
+    # ceiling caps it at max_dist_A. Pair at 3000 Å should be REJECTED when
+    # max_dist_A=2500.
+    rho = 1000.0
+    ref = [_ep(0, (0, 0, 0))]
+    mov = [_ep(0, (3000, 0, 0))]
+    matches, *_, _ = mt.match_sections(
+        ref, mov, rho,
+        max_dist_rho=5.0, min_dist_A=500.0, max_dist_A=2500.0,
+    )
+    assert matches == []
+
+
+def test_distance_gate_clamps_to_physical_min():
+    # ρ-scaling alone would gate at 50 Å (5 × ρ) but the physical floor
+    # (default 500 Å) lifts the gate to 500 Å. Pair at 200 Å should be KEPT.
+    rho = 10.0
+    ref = [_ep(0, (0, 0, 0))]
+    mov = [_ep(0, (200, 0, 0))]
+    matches, *_, _ = mt.match_sections(
+        ref, mov, rho,
+        max_dist_rho=5.0, min_dist_A=500.0, max_dist_A=2500.0,
+    )
+    assert len(matches) == 1
 
 
 def test_angle_gate_blocks_misaligned_directions():
@@ -100,7 +133,7 @@ def test_outlier_match_is_rejected():
     # Corrupt one moving endpoint so its post-fit residual is large but it still
     # falls inside the distance gate of its true partner's neighbourhood.
     mov[12]["pos"] = mov[12]["pos"] + np.array([6.0, -6.0, 0.0])
-    matches, ref_xy, mov_xy, conf = mt.match_sections(ref, mov, rho, max_resid_rho=0.5)
+    matches, ref_xy, mov_xy, conf, _ = mt.match_sections(ref, mov, rho, max_resid_rho=0.5)
     # The corrupted pair should be dropped; the rest survive.
     assert conf["n_matches"] >= len(ref) - 2
     # No surviving pair has a large residual to the consensus shift.
@@ -112,12 +145,12 @@ def test_confidence_separates_good_from_incoherent():
     ref = _grid_endpoints()
     rho = 10.0
     good = [_ep(e["id"], e["pos"] + np.array([1.0, 1.0, 0.0]), e["dir"]) for e in ref]
-    _, _, _, conf_good = mt.match_sections(ref, good, rho)
+    _, _, _, conf_good, _ = mt.match_sections(ref, good, rho)
     # Incoherent: random per-endpoint shifts inside the gate.
     rng = np.random.default_rng(0)
     bad = [
         _ep(e["id"], e["pos"] + np.r_[rng.uniform(-15, 15, 2), 0.0], e["dir"])
         for e in ref
     ]
-    _, _, _, conf_bad = mt.match_sections(ref, bad, rho, max_resid_rho=100.0)
+    _, _, _, conf_bad, _ = mt.match_sections(ref, bad, rho, max_resid_rho=100.0)
     assert conf_good["shift_incoherence_rho"] < conf_bad["shift_incoherence_rho"]

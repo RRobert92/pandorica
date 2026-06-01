@@ -55,29 +55,40 @@ def _classify(path: str) -> str:
 
 
 def _read_graph_layer(path: str) -> LayerData:
-    """Read a spatial graph; return a Shapes layer with one path per filament."""
-    from pandorica.io.amira import read_segmented_points
+    """Read a spatial graph; return a Shapes layer with one path per filament.
+
+    Per-edge diagnostic fields written by pandorica's stitcher (``ChainLength``,
+    ``MaxJointAngleDeg``, ``NJoints``, ``WasSplit``) are attached to the layer
+    as ``properties``. The default colour is a uniform yellow — use the
+    ``Spatial Graph Inspector`` widget to colour by those properties
+    interactively, or change Edge → "Choose property" in the layer controls.
+    """
+    from pandorica.io.amira import read_spatial_graph
     from pandorica.napari._geometry import coords_to_paths_zyx
 
-    coords = read_segmented_points(path)
+    sg = read_spatial_graph(path)
+    coords = sg.segmented_points() if sg.n_points > 0 else None
     if coords is None or len(coords) == 0:
-        # Still return a (visible) empty Shapes layer so the user knows the
-        # file was recognised; nothing to draw.
         return ([], {"name": os.path.basename(path), "shape_type": "path"}, "shapes")
     paths = coords_to_paths_zyx(coords)
     if not paths:
         return ([], {"name": os.path.basename(path), "shape_type": "path"}, "shapes")
-    return (
-        paths,
-        {
-            "name": os.path.basename(path),
-            "shape_type": "path",
-            "edge_color": "yellow",
-            "edge_width": 2.0,
-            "opacity": 0.9,
-        },
-        "shapes",
-    )
+
+    edge_props: dict = {}
+    for name, arr in {**sg.edge_int_fields, **sg.edge_float_fields}.items():
+        if arr.shape[0] == len(paths):
+            edge_props[name] = np.asarray(arr)
+
+    layer_kwargs = {
+        "name": os.path.basename(path),
+        "shape_type": "path",
+        "edge_color": "yellow",
+        "edge_width": 20.0,
+        "opacity": 0.9,
+    }
+    if edge_props:
+        layer_kwargs["properties"] = edge_props
+    return (paths, layer_kwargs, "shapes")
 
 
 def _read_volume_layer(path: str) -> LayerData:

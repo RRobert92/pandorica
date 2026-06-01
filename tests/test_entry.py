@@ -77,7 +77,11 @@ def test_matcher_param_threads_through():
     # A near-zero distance gate starves the matcher → interfaces fail to certify.
     # Needs jitter: on noise-free data the PCA coarse aligns clouds to < 1e-6·ρ and
     # would match even at a tiny gate, masking the param's effect.
+    # Disable the physical floor (``min_dist_A=0``) so the starved gate isn't
+    # rescued by the absolute-units clamp the matcher applies by default.
     _, coords = _stack([3.0, -2.0, 1.0], seed=5, jitter=2.0)
     ok = register_section_stack(coords, max_dist_rho=8.0)
-    starved = register_section_stack(coords, max_dist_rho=1e-6)
+    starved = register_section_stack(
+        coords, max_dist_rho=1e-6, min_dist_A=0.0, max_dist_A=0.0
+    )
     assert ok.accepted and not starved.accepted

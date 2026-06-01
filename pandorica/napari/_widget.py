@@ -357,8 +357,14 @@ class StitchValidatorWidget(QWidget):
             return
         out = join(self.dataset.folder, "stitched_output")
         warps = None
+        chain_pairs = None
+        chain_accepted = None
         if self.apply_warp_cb.isChecked() and self.result is not None:
             warps = stitch.result_warps(self.result)
+            chain_pairs = [iface.id_pairs for iface in self.result.base.interfaces]
+            chain_accepted = [
+                bool(iface.qc.accepted) for iface in self.result.base.interfaces
+            ]
         image_warps = None
         if self.image_fill_cb.isChecked():
             from pandorica.stitch import image_warp as _image_warp
@@ -388,6 +394,8 @@ class StitchValidatorWidget(QWidget):
                 warp_zblend=self.zblend_cb.isChecked(),
                 image_warps=image_warps,
                 use_gpu=self.gpu_cb.isChecked(),
+                interface_id_pairs=chain_pairs,
+                interface_accepted=chain_accepted,
                 progress=lambda m, fr: self.accept_lbl.setText(
                     f"Export: {m} ({fr*100:.0f}%)"
                 ),
@@ -420,7 +428,7 @@ class StitchValidatorWidget(QWidget):
                     shape_type="path",
                     name=f"{prefix}:{self.dataset.names[i]}",
                     edge_color=color,
-                    edge_width=2.0,
+                    edge_width=20.0,
                     opacity=0.9 if aligned else 0.55,
                     visible=aligned,
                 )
@@ -1209,3 +1217,340 @@ class CoarseGTWidget(QWidget):
 
     def _log(self, msg: str) -> None:
         self.status.setPlainText(msg)
+
+
+# =========================================================================== #
+#  Spatial Graph Inspector
+# =========================================================================== #
+class SpatialGraphInspectorWidget(QWidget):
+    """Load one ``.am`` spatial graph and inspect its per-filament diagnostics.
+
+    Each filament becomes one path in a Shapes layer; per-edge labels written
+    by the stitcher (``ChainLength``, ``MaxJointAngleDeg``, ``NJoints``,
+    ``WasSplit``) are attached as napari ``properties`` and can be used to
+    colour or filter the view. Optionally, points marked ``AtJoint == 1`` get
+    a separate Points layer coloured by ``JointAngleDeg`` so you can see
+    exactly where each chain crosses a section.
+    """
+
+    _UNIFORM_LABEL = "(uniform yellow)"
+
+    def __init__(self, napari_viewer):
+        super().__init__()
+        self.viewer = napari_viewer
+        self._path: Optional[str] = None
+        self._paths: List[np.ndarray] = []
+        self._edge_props: Dict[str, np.ndarray] = {}
+        self._coords: Optional[np.ndarray] = None  # (N, 4) [seg, x, y, z]
+        self._point_props: Dict[str, np.ndarray] = {}
+        self._shapes_layer = None
+        self._joint_layer = None
+        self._build_ui()
+
+    # ---- UI -------------------------------------------------------------- #
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+
+        box = QGroupBox("File")
+        f = QFormLayout(box)
+        self.file_lbl = QLabel("(none)")
+        self.file_lbl.setWordWrap(True)
+        browse = QPushButton("Browse .am…")
+        browse.clicked.connect(self._browse)
+        load_btn = QPushButton("Load")
+        load_btn.clicked.connect(self._load)
+        f.addRow(browse, self.file_lbl)
+        f.addRow(load_btn)
+        layout.addWidget(box)
+
+        box = QGroupBox("Display")
+        f = QFormLayout(box)
+        self.color_combo = QComboBox()
+        self.color_combo.addItem(self._UNIFORM_LABEL)
+        self.color_combo.currentIndexChanged.connect(self._apply_view)
+        f.addRow("Colour by", self.color_combo)
+        self.cmap_combo = QComboBox()
+        # Common continuous colormaps that napari ships with.
+        for cm in ("viridis", "magma", "plasma", "inferno", "turbo"):
+            self.cmap_combo.addItem(cm)
+        self.cmap_combo.currentIndexChanged.connect(self._apply_view)
+        f.addRow("Colormap", self.cmap_combo)
+        self.show_joints_cb = QCheckBox(
+            "Show joint points (coloured by JointAngleDeg)"
+        )
+        self.show_joints_cb.stateChanged.connect(self._apply_view)
+        f.addRow(self.show_joints_cb)
+        layout.addWidget(box)
+
+        box = QGroupBox("Filter (hide filaments outside the range)")
+        f = QFormLayout(box)
+        self.min_chain_len = QSpinBox()
+        self.min_chain_len.setRange(1, 999)
+        self.min_chain_len.setValue(1)
+        self.min_chain_len.valueChanged.connect(self._apply_view)
+        f.addRow("Min ChainLength", self.min_chain_len)
+        self.min_angle = QDoubleSpinBox()
+        self.min_angle.setRange(0.0, 180.0)
+        self.min_angle.setDecimals(1)
+        self.min_angle.setValue(0.0)
+        self.min_angle.setSuffix(" °")
+        self.min_angle.valueChanged.connect(self._apply_view)
+        f.addRow("Min MaxJointAngleDeg", self.min_angle)
+        self.only_split_cb = QCheckBox("Only WasSplit == 1")
+        self.only_split_cb.stateChanged.connect(self._apply_view)
+        f.addRow(self.only_split_cb)
+        layout.addWidget(box)
+
+        self.stats = QTextEdit()
+        self.stats.setReadOnly(True)
+        self.stats.setMaximumHeight(110)
+        layout.addWidget(self.stats)
+
+        layout.addStretch(1)
+
+    # ---- Actions --------------------------------------------------------- #
+    def _browse(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open spatial graph (.am)", filter="Amira spatial graph (*.am)"
+        )
+        if path:
+            self._path = path
+            self.file_lbl.setText(os.path.basename(path))
+
+    def _load(self) -> None:
+        if not self._path:
+            self._warn("Pick an .am file first.")
+            return
+        try:
+            from pandorica.io.amira import read_spatial_graph
+
+            sg = read_spatial_graph(self._path)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(
+                self, "Read failed", f"{exc}\n\n{traceback.format_exc()}"
+            )
+            return
+
+        if sg.n_points == 0 or sg.n_edges == 0:
+            self._warn("Spatial graph is empty.")
+            return
+
+        coords = sg.segmented_points()
+        self._coords = coords
+        self._paths = npg.coords_to_paths_zyx(coords)
+        n_paths = len(self._paths)
+
+        edge_props: Dict[str, np.ndarray] = {}
+        for name, arr in {**sg.edge_int_fields, **sg.edge_float_fields}.items():
+            if arr.shape[0] == n_paths:
+                edge_props[name] = np.asarray(arr)
+        self._edge_props = edge_props
+
+        point_props: Dict[str, np.ndarray] = {}
+        for name, arr in {**sg.point_int_fields, **sg.point_float_fields}.items():
+            if arr.shape[0] == coords.shape[0]:
+                point_props[name] = np.asarray(arr)
+        self._point_props = point_props
+
+        # Populate colour-by combo with the available edge fields.
+        prev = self.color_combo.currentText()
+        self.color_combo.blockSignals(True)
+        self.color_combo.clear()
+        self.color_combo.addItem(self._UNIFORM_LABEL)
+        for name in edge_props.keys():
+            self.color_combo.addItem(name)
+        # Default to MaxJointAngleDeg if present, else uniform.
+        if "MaxJointAngleDeg" in edge_props:
+            self.color_combo.setCurrentText("MaxJointAngleDeg")
+        elif prev in edge_props:
+            self.color_combo.setCurrentText(prev)
+        self.color_combo.blockSignals(False)
+
+        # Replace any previous layer.
+        self._remove_layer(self._shapes_layer)
+        self._shapes_layer = None
+        self._remove_layer(self._joint_layer)
+        self._joint_layer = None
+
+        self._shapes_layer = self.viewer.add_shapes(
+            self._paths,
+            name=os.path.basename(self._path),
+            shape_type="path",
+            edge_color="yellow",
+            edge_width=20.0,
+            opacity=0.9,
+            properties=edge_props if edge_props else None,
+        )
+        self._apply_view()
+        self._update_stats()
+
+    # ---- Apply view ------------------------------------------------------ #
+    def _filter_mask(self) -> np.ndarray:
+        n = len(self._paths)
+        keep = np.ones(n, dtype=bool)
+        if "ChainLength" in self._edge_props:
+            keep &= self._edge_props["ChainLength"] >= int(self.min_chain_len.value())
+        if "MaxJointAngleDeg" in self._edge_props:
+            keep &= self._edge_props["MaxJointAngleDeg"] >= float(
+                self.min_angle.value()
+            )
+        if self.only_split_cb.isChecked() and "WasSplit" in self._edge_props:
+            keep &= self._edge_props["WasSplit"].astype(bool)
+        return keep
+
+    def _apply_view(self) -> None:
+        if not self._paths:
+            return
+
+        keep = self._filter_mask()
+        kept_paths = [p for p, k in zip(self._paths, keep) if k]
+        kept_props = {
+            name: np.asarray(arr)[keep] for name, arr in self._edge_props.items()
+        } if self._edge_props else None
+
+        # Rebuild the Shapes layer. napari 0.7's Shapes layer has no `shown`
+        # attribute, so per-shape visibility = recreating with the kept paths
+        # only. Fast enough for the typical filament count (<= a few k); if
+        # this becomes a hotspot we can switch to per-shape alpha encoding.
+        prev_name = (
+            self._shapes_layer.name
+            if self._shapes_layer is not None
+            else os.path.basename(self._path or "spatial graph")
+        )
+        self._remove_layer(self._shapes_layer)
+        self._shapes_layer = None
+        if kept_paths:
+            self._shapes_layer = self.viewer.add_shapes(
+                kept_paths,
+                name=prev_name,
+                shape_type="path",
+                edge_color="yellow",
+                edge_width=20.0,
+                opacity=0.9,
+                properties=kept_props,
+            )
+            # Apply colour-by *after* construction so napari knows the
+            # properties dict before binding the color.
+            choice = self.color_combo.currentText()
+            cmap = self.cmap_combo.currentText()
+            if (
+                choice != self._UNIFORM_LABEL
+                and kept_props is not None
+                and choice in kept_props
+            ):
+                try:
+                    self._shapes_layer.edge_color = choice
+                    self._shapes_layer.edge_colormap = cmap
+                except Exception:  # noqa: BLE001
+                    pass
+
+        self._update_joint_overlay(keep)
+
+    def _update_joint_overlay(self, kept_filament_mask: np.ndarray) -> None:
+        want = self.show_joints_cb.isChecked()
+        if not want:
+            self._remove_layer(self._joint_layer)
+            self._joint_layer = None
+            return
+        if (
+            self._coords is None
+            or "AtJoint" not in self._point_props
+            or "JointAngleDeg" not in self._point_props
+        ):
+            self._remove_layer(self._joint_layer)
+            self._joint_layer = None
+            return
+        # Restrict joint points to the filaments that survived the filter:
+        # the joint dots only make sense for chains that are actually shown.
+        joint_mask = self._point_props["AtJoint"].astype(bool)
+        if kept_filament_mask is not None and kept_filament_mask.size:
+            # Map each coord row to its filament index via segment id. The
+            # writer densified ids to 0..n_paths-1 in the same order as
+            # ``coords_to_paths_zyx`` enumerates filaments, so the segment id
+            # IS the filament index.
+            seg_ids = self._coords[:, 0].astype(int)
+            valid = seg_ids < kept_filament_mask.size
+            filament_keep_per_row = np.zeros_like(seg_ids, dtype=bool)
+            filament_keep_per_row[valid] = kept_filament_mask[seg_ids[valid]]
+            joint_mask &= filament_keep_per_row
+
+        if not joint_mask.any():
+            self._remove_layer(self._joint_layer)
+            self._joint_layer = None
+            return
+
+        # napari Points axes order = (z, y, x) — match the Shapes ZYX layout.
+        xyz = self._coords[joint_mask, 1:4]
+        zyx = xyz[:, ::-1]  # (z, y, x)
+        angles = self._point_props["JointAngleDeg"][joint_mask].astype(float)
+        if self._joint_layer is None:
+            self._joint_layer = self.viewer.add_points(
+                zyx,
+                name="joint angles",
+                size=10,
+                properties={"JointAngleDeg": angles},
+                face_color="JointAngleDeg",
+                face_colormap=self.cmap_combo.currentText(),
+            )
+        else:
+            self._joint_layer.data = zyx
+            self._joint_layer.properties = {"JointAngleDeg": angles}
+            try:
+                self._joint_layer.face_color = "JointAngleDeg"
+                self._joint_layer.face_colormap = self.cmap_combo.currentText()
+            except Exception:  # noqa: BLE001
+                pass
+
+    # ---- Stats ----------------------------------------------------------- #
+    def _update_stats(self) -> None:
+        n = len(self._paths)
+        lines = [f"filaments: {n}"]
+        if "ChainLength" in self._edge_props:
+            cl = self._edge_props["ChainLength"]
+            n_chained = int(np.sum(cl > 1))
+            lines.append(
+                f"chained (≥2 sections): {n_chained}  "
+                f"({100.0 * n_chained / max(n, 1):.1f}%)"
+            )
+            lines.append(
+                f"chain length: min={int(cl.min())}  max={int(cl.max())}  "
+                f"mean={float(cl.mean()):.2f}"
+            )
+        chained = (
+            self._edge_props["ChainLength"] > 1
+            if "ChainLength" in self._edge_props
+            else np.ones(n, dtype=bool)
+        )
+        if "MaxJointAngleDeg" in self._edge_props and chained.any():
+            ma = self._edge_props["MaxJointAngleDeg"][chained]
+            lines.append(
+                f"local joint angle: min={float(ma.min()):.1f}°  "
+                f"max={float(ma.max()):.1f}°  mean={float(ma.mean()):.1f}°"
+            )
+            lines.append(
+                f"  > 45°: {int(np.sum(ma > 45)):d}   "
+                f"> 60°: {int(np.sum(ma > 60)):d}   "
+                f"> 80°: {int(np.sum(ma > 80)):d}"
+            )
+        if "MaxJointOverallDeg" in self._edge_props and chained.any():
+            mo = self._edge_props["MaxJointOverallDeg"][chained]
+            lines.append(
+                f"overall direction angle: max={float(mo.max()):.1f}°  "
+                f"mean={float(mo.mean()):.1f}°"
+            )
+        if "WasSplit" in self._edge_props:
+            ws = self._edge_props["WasSplit"]
+            lines.append(f"WasSplit==1: {int(np.sum(ws.astype(bool)))}")
+        self.stats.setPlainText("\n".join(lines))
+
+    # ---- misc ------------------------------------------------------------ #
+    def _remove_layer(self, layer) -> None:
+        if layer is None:
+            return
+        try:
+            self.viewer.layers.remove(layer)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _warn(self, msg: str) -> None:
+        QMessageBox.warning(self, "Spatial Graph Inspector", msg)

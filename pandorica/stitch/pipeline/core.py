@@ -38,7 +38,7 @@ high-Z — so the mapping is handled in ``_face`` below.)
 """
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Tuple
 
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
@@ -69,13 +69,20 @@ from pandorica.stitch.matching.mt_transform import (
 
 @dataclass
 class InterfaceResult:
-    """Per-interface outcome (section k → k+1)."""
+    """Per-interface outcome (section k → k+1).
+
+    ``id_pairs`` carries the surviving MT correspondences for this interface as
+    ``(ref_mt_id, mov_mt_id, cost)`` — the input by which the downstream chain
+    builder joins per-section spline IDs into single cross-section filaments.
+    Empty when the interface failed or was rejected.
+    """
 
     coarse: Pose
     relative: Pose
     warp: GuardedWarp
     qc: InterfaceQC
     confidence: dict
+    id_pairs: List[Tuple[int, int, float]] = field(default_factory=list)
 
 
 @dataclass
@@ -168,7 +175,7 @@ def _evaluate_seed(seed, ref_eps, mov_eps, rho, allow_scale, match_kwargs):
     relative rigid ``rel`` (mov-local → ref-local). ``None`` if too few matches.
     """
     mov_c = _apply_pose_to_endpoints(mov_eps, seed)
-    _, rx, mxc, cf = match_sections(ref_eps, mov_c, rho, **match_kwargs)
+    _, rx, mxc, cf, id_pairs = match_sections(ref_eps, mov_c, rho, **match_kwargs)
     if len(rx) < 3:
         return None
     b_local = apply_pose(invert_pose(seed), mxc)
@@ -191,6 +198,7 @@ def _evaluate_seed(seed, ref_eps, mov_eps, rho, allow_scale, match_kwargs):
         "mxc": mxc,
         "cf": cf,
         "rel": rel,
+        "id_pairs": id_pairs,
     }
 
 
@@ -200,7 +208,7 @@ def _failed_interface(reason: str) -> InterfaceResult:
     cert = FieldCertificate(0.0, np.inf, 0.0, 0.05, 1.0, passed=False)
     qc = InterfaceQC(False, False, 0.0, np.inf, 0.0, reasons=[reason])
     return InterfaceResult(
-        dict(IDENTITY), dict(IDENTITY), GuardedWarp(cert, 0.0, False, None), qc, {}
+        dict(IDENTITY), dict(IDENTITY), GuardedWarp(cert, 0.0, False, None), qc, {}, []
     )
 
 
@@ -262,7 +270,9 @@ def register_section_stack(
             continue
 
         rho_k = _endpoint_rho(ref_eps)
-        match_kwargs.setdefault("max_dist_rho", 8.0)
+        # The effective distance gate is now clipped to physical (Å) bounds —
+        # see ``matcher._resolve_max_dist``. No pipeline-level override is
+        # needed; the matcher's defaults are calibrated for MT physiology.
 
         img_angle = coarse_angles[k] if coarse_angles is not None else None
         if img_angle is not None:
@@ -356,7 +366,9 @@ def register_section_stack(
             max_shift_incoherence_rho=qc_max_shift_incoherence_rho,
             max_tangent_deg=qc_max_tangent_deg,
         )
-        results.append(InterfaceResult(coarse_pose, rel, warp, qc, conf))
+        results.append(
+            InterfaceResult(coarse_pose, rel, warp, qc, conf, best.get("id_pairs", []))
+        )
 
     poses = global_pose_refine(
         solver_interfaces,

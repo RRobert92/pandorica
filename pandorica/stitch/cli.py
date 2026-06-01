@@ -299,6 +299,8 @@ def run_stitch(
         )
         poses = stitch.result_poses(result)
         mt_warps = stitch.result_warps(result)
+        chain_pairs = [iface.id_pairs for iface in result.base.interfaces]
+        chain_accepted = [bool(iface.qc.accepted) for iface in result.base.interfaces]
         _say(
             "--- Per-interface (coarse / rel / match / warp / QC / coarse-flag / intensity) ---"
         )
@@ -359,6 +361,8 @@ def run_stitch(
             ds, metric=method if method != "mi" else "ncc", workers=workers, log=_say
         )
         mt_warps = None
+        chain_pairs = None
+        chain_accepted = None
     t_stitch = time.perf_counter() - t
     _say("")
     _say("--- Global per-section poses (section 0 = gauge) ---")
@@ -434,6 +438,8 @@ def run_stitch(
                 warp_coarse_px=warp_coarse_px,
                 trim_to_mts=trim_to_mts,
                 mt_pad_frac=mt_pad_frac,
+                interface_id_pairs=chain_pairs,
+                interface_accepted=chain_accepted,
                 progress=_export_progress,
             )
     else:
@@ -449,6 +455,8 @@ def run_stitch(
             warp_coarse_px=warp_coarse_px,
             trim_to_mts=trim_to_mts,
             mt_pad_frac=mt_pad_frac,
+            interface_id_pairs=chain_pairs,
+            interface_accepted=chain_accepted,
             progress=lambda m, fr: log(f"  export: {m} ({fr * 100:.0f}%)"),
         )
     t_export = time.perf_counter() - t

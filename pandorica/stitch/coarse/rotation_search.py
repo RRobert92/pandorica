@@ -199,7 +199,7 @@ def global_rotation_search(
     # denominator.
     def inlier_count(th, gate):
         movc = _rotate_endpoints(mov_eps, th, mc, rc)
-        _, rx, _, _ = match_sections(ref_eps, movc, rho, max_dist_rho=gate)
+        _, rx, _, _, _ = match_sections(ref_eps, movc, rho, max_dist_rho=gate)
         return len(rx)
 
     counts = np.array([float(inlier_count(th, coarse_gate_rho)) for th in angles])
@@ -220,7 +220,7 @@ def global_rotation_search(
 
         def fine_residual(th):
             movc = _rotate_endpoints(mov_eps, th, mc, rc)
-            _, rx, mxc, _ = match_sections(ref_eps, movc, rho, max_dist_rho=fine_gate)
+            _, rx, mxc, _, _ = match_sections(ref_eps, movc, rho, max_dist_rho=fine_gate)
             if len(rx) < 3:
                 return np.inf
             return float(np.sqrt(((rx - mxc) ** 2).sum(1).mean()))
