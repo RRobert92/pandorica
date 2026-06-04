@@ -289,7 +289,10 @@ def run_stitch(
 
     # --- poses: MT-based or image-only ------------------------------------- #
     t = time.perf_counter()
+    t_solve = 0.0
+    t_xcheck = 0.0
     if use_mt:
+        _ts = time.perf_counter()
         result = stitch_sections(
             coords,
             warp_omega_max=warp_omega,
@@ -297,6 +300,7 @@ def run_stitch(
             allow_scale=allow_scale,
             lambda_scale=lambda_scale,
         )
+        t_solve = time.perf_counter() - _ts
         poses = stitch.result_poses(result)
         mt_warps = stitch.result_warps(result)
         chain_pairs = [iface.id_pairs for iface in result.base.interfaces]
@@ -356,9 +360,11 @@ def run_stitch(
             _say("")
             _say("--- Dual-chain cross-check (MT vs image RANSAC; volumes present) ---")
             xc_metric = method if method != "mi" else "ncc"
+            _tx = time.perf_counter()
             poses, xreports = reconcile_image_mt(
                 ds, poses, rows, metric=xc_metric, workers=workers, log=_say
             )
+            t_xcheck = time.perf_counter() - _tx
             xflag, xoverride = [], []
             for r in xreports:
                 rs = "img" if r["rot_src"] == "img" else "MT "
@@ -398,9 +404,11 @@ def run_stitch(
         _say("! and prefer providing *_spatialGraph.am (MT-based) when possible.")
         _say("!" * 71)
         _say("--- Image-only coarse poses (weighted-RANSAC rigid: rotation + shift) ---")
+        _ts = time.perf_counter()
         poses = image_only_poses(
             ds, metric=method if method != "mi" else "ncc", workers=workers, log=_say
         )
+        t_solve = time.perf_counter() - _ts
         mt_warps = None
         chain_pairs = None
         chain_accepted = None
@@ -511,6 +519,12 @@ def run_stitch(
     _say("--- Compute time ---")
     _say(f"  load          : {t_load:7.1f} s")
     _say(f"  register      : {t_stitch:7.1f} s")
+    if use_mt:
+        _say(f"    mt-solve    : {t_solve:7.1f} s")
+        if has_vol:
+            _say(f"    cross-check : {t_xcheck:7.1f} s")
+    else:
+        _say(f"    image-pose  : {t_solve:7.1f} s")
     _say(f"  image-fill    : {t_fill:7.1f} s")
     _say(f"  export/warp   : {t_export:7.1f} s")
     _say(f"  TOTAL         : {total:7.1f} s")

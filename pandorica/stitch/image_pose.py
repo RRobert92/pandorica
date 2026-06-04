@@ -575,16 +575,26 @@ def reconcile_image_mt(
     if n < 2:
         return poses, []
 
-    # Harvest the image candidate per interface by running the validated image path
-    # with a collector hook (its own logging silenced — we log the cross-check below).
+    # Harvest the image candidate per interface by running the validated image path with
+    # a collector hook. Its verbose logging is silenced, but the hook streams a one-line
+    # progress note as each interface finishes — the harvest is the slow part, so without
+    # this the stage looks frozen (no output until the whole cross-check table dumps).
     img_info: List[dict] = image_candidates
     if img_info is None:
         img_info = []
+
+        def _collect(info):
+            img_info.append(info)
+            log(
+                f"  [xcheck] image pose {len(img_info)}/{n - 1}: {info['label']}  "
+                f"rot={info['rot']:+.1f}°  agree={info['agree']:.0%}"
+            )
+
         image_only_poses(
             dataset, load_downscale=load_downscale, n_slices=n_slices,
             invert_z=invert_z, metric=metric, match_grid=match_grid,
             match_search=match_search, min_inlier_frac=min_inlier_frac,
-            workers=workers, on_interface=img_info.append, log=lambda *a, **k: None,
+            workers=workers, on_interface=_collect, log=lambda *a, **k: None,
         )
 
     # MT relatives straight from the committed absolute poses (robust to any global
