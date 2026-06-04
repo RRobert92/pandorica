@@ -93,11 +93,35 @@ End to end, for a stack of *n* sections (`pipeline/stitcher.py` →
    otherwise **flagged with reasons**, never silently stitched.
 
 7. **Image-only fallback.** Sections without MT graphs are coarsely posed from
-   image content alone (`image_pose.py`). Rotation comes from cell **geometry**
-   (`contour_rotation.py`): the nuclear-envelope contour fixes the magnitude and the
-   organelle constellation votes on the 180° sign. The sign is weak on near-circular
-   cross-sections, so weak-flip interfaces are **flagged for review** (never silently
-   committed); translation is then a block-match as in the MT path.
+   image content alone (`image_pose.py`). Both rotation and translation come from one
+   large-window block-match plus a **confidence-weighted RANSAC** rigid fit: each swept
+   angle is block-matched onto the reference and a rigid transform (rotation +
+   translation) is fitted on the most matchable cells, keeping the angle with the most
+   weighted inlier **support** (a wrong 180° flip leaves few rigidly consistent cells, so
+   its support collapses), and that angle carries its RANSAC pose. Cell **geometry**
+   (`contour_rotation.py` — nuclear-envelope contour + organelle constellation) runs as
+   an independent cross-check. An interface is **flagged for review** when the two 180°
+   branches tie in weighted support (a central-disk NCC then breaks the tie, but the
+   flag stays), when geometry disagrees, or when too few cells are rigid inliers to trust
+   the shift (it then keeps a rotation-only rigid) — never silently committed.
+
+   **Dual-chain cross-check (MT *and* volumes present).** When a stack has both MT
+   graphs and volumes the same image path runs a *second* time, now as an independent
+   check on the solved MT poses rather than a fallback (`reconcile_image_mt`). Per
+   interface it keeps the MT pose **unless** the image disagrees and is the more certain
+   side, deciding rotation and translation separately. **Rotation/sign:** agreement
+   within tolerance keeps MT; on disagreement the sign-confident side wins (MT: QC-clean
+   and not hybrid-flagged; image: shift-trusted and not branch-ambiguous), tie-broken by
+   inlier fraction and defaulting to MT — the 180° sign is where the image RANSAC support
+   is a strong independent vote. **Translation:** *gated on the image's own confidence* —
+   if the image abstained across the gap the check stays silent (keeps MT, raises no
+   flag), so a decorrelated gap can't inject noise; only a confident image shift that
+   differs by more than a drift-scaled tolerance can override, and only when MT is itself
+   weak or the image has the larger inlier fraction. A good MT result is therefore never
+   made worse by a low-confidence image guess; genuine disagreements are **flagged for
+   visual review**. The image and MT poses are compared in the same Å frame on *where
+   each moves the shared face-centre point* (`_pose_center_shift`), so the comparison is
+   invariant to how each side parametrised its translation.
 
 8. **Volume export.** Solved poses (and the guarded warps) are applied
    slice-wise into a shared canvas with optional Z-blended warp and image-fill of
@@ -125,7 +149,7 @@ cli              headless run_stitch orchestration + reporting
 io               dataset discovery / loading (Dataset, load_dataset)
 stitch           result accessors + stitched-output export
 image_pose       image-only coarse poses (no-MT fallback)
-contour_rotation image-only rotation from nuclear contour + organelle constellation
+contour_rotation image-only rotation cross-check (nuclear contour + organelle constellation)
 image_warp       image-fill residual warps for MT-free regions
 geometry         pose <-> pixel math, boundary landmarks
 match            image block-matching metrics (multiprocessing-safe)
@@ -270,6 +294,9 @@ deformation modes, and biological priors all differ.
   was wrong by 120–170°), and the organelle constellation votes on the 180° sign.
   The sign vote is weak on near-circular faces, so weak-flip interfaces are **flagged
   for review**, never silently committed. (Tuning the flip vote / segmentation across
-  more specimens remains open.)
+  more specimens remains open.) Rotation is now chosen primarily by a confidence-weighted
+  RANSAC rigid fit (max weighted inlier support) over the block-match sweep in
+  `image_pose.py`; this geometry estimate is kept as the independent cross-check (the
+  review flag) — on abstain the RANSAC rotation is retained and only the shift is dropped.
 - [ ] **Broader validation** — exercise across more datasets, voxel sizes, and
   section counts; expand the regression suite with real-data fixtures.

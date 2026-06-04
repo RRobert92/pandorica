@@ -245,6 +245,61 @@ def test_rotation_search_recovers_angle():
     assert abs(((found - (-25.0)) + 180) % 360 - 180) < 2.0
 
 
+def test_rigid_from_pairs_recovers_transform():
+    # Closed-form weighted 2-D rigid (Kabsch): dst = R(theta)*src + t exactly.
+    rng = np.random.default_rng(2)
+    src = rng.standard_normal((12, 2)) * 80.0
+    th = np.deg2rad(-23.0)
+    R = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]])
+    t = np.array([-6.0, 11.0])
+    dst = src @ R.T + t
+    dth, t_hat = ip._rigid_from_pairs(src, dst)
+    assert abs(np.rad2deg(dth) - (-23.0)) < 1e-6
+    assert np.allclose(t_hat, t, atol=1e-6)
+
+
+def test_ransac_rigid_recovers_transform_with_outliers():
+    # Weighted RANSAC fits a rigid (rotation+translation) from cell correspondences and
+    # rejects gross outliers; the minimal sample is "2 good candidates" (2 point pairs).
+    rng = np.random.default_rng(1)
+    src = rng.standard_normal((24, 2)) * 100.0
+    th = np.deg2rad(18.0)
+    R = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]])
+    t = np.array([7.0, -4.0])
+    dst = src @ R.T + t
+    dst[:9] = rng.standard_normal((9, 2)) * 400.0  # 9/24 gross outliers
+    conf = np.ones(24)
+    dth, t_hat, inl, support = ip._ransac_rigid(src, dst, conf, tol=3.0)
+    assert abs(np.rad2deg(dth) - 18.0) < 0.5  # rotation recovered through the outliers
+    assert np.allclose(t_hat, t, atol=0.5)  # translation recovered
+    assert not inl[:9].any() and inl[9:].all()  # exactly the 15 clean pairs are inliers
+    assert support == 15.0  # weighted support = sum conf over inliers (conf == 1)
+
+
+def test_agree_rotation_picks_true_branch_by_support():
+    # Image-only rotation ranks each swept angle by weighted RANSAC inlier SUPPORT (sum
+    # of match confidence over cells consistent with ONE rigid transform), not a raw
+    # agreeing-cell count. A wrong 180° flip leaves few rigidly consistent cells, so its
+    # support collapses while the true angle's stays high. Realistically-scaled blocky
+    # texture (raw std ≳ 5, ~0–255) so block_match's std / peakiness gates pass, and the
+    # 8-px blocks survive the rotation interpolation.
+    rng = np.random.default_rng(0)
+    fixed = (np.kron(rng.standard_normal((32, 32)), np.ones((8, 8))) * 50 + 128).astype(
+        np.float32
+    )  # 256×256
+    h, w = fixed.shape
+    center = np.array([w / 2.0, h / 2.0])
+    true = 15.0
+    moving = ip._rotate_face(fixed, true, center)  # moving = fixed rotated by +15°
+    mk = dict(metric="ncc", grid=8, search=24, tol=8.0, workers=1)
+    win, opp = ip._agree_rotation(fixed, moving, center, mk=mk)
+    # recovers the true branch (≈ -15°, aligning moving onto fixed), NOT the +165° flip
+    assert ip._angle_gap(win["rot"], -true) < 5.0
+    assert opp is not None
+    # the flip keeps few rigidly consistent cells, so it loses on weighted SUPPORT
+    assert win["support"] > opp["support"]
+
+
 def test_gpu_warp_matches_cpu_zblend():
     # torch grid_sample (CPU) must reproduce the scipy Z-blend warp
     rng = np.random.default_rng(0)

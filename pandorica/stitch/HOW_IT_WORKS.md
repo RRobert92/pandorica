@@ -72,7 +72,8 @@ flowchart TB
     D --> E[4. Solve all section<br/>positions together]
     E --> F[5. Smooth bend<br/>to fine-tune fit]
     F --> G[6. Check every joint<br/>QC certificate]
-    G -->|all pass| H[Stitched volume]
+    G -->|all pass| J[6b. Image cross-check<br/>if volumes present]
+    J --> H[Stitched volume]
     G -->|any fail| I[Flag for review<br/>never silently wrong]
 ```
 
@@ -253,6 +254,60 @@ produce a wrong stack.**
 
 ---
 
+## A second opinion — when you have both MTs and images
+
+Phases 1–6 build the stack from the **MT chain**: the stubs decide the
+rotation, the sign, and the fit. But if the dataset *also* carries the image
+volumes, we have a completely independent way to estimate the same pose —
+the **image RANSAC** estimate from the no-MT path (next section). When both
+exist, we run that image estimate too and treat it as a second opinion.
+
+The analogy: the MT chain is your specialist reading the chart. The image
+estimate is a second doctor who never saw the chart and only looks at the
+raw scan. If both agree, you trust the result more. If they disagree, you
+look harder — but you do not throw out the specialist just because the
+second doctor is less sure.
+
+That last part is the whole design. The two estimates do **not** get
+averaged. The MT result stays unless the image both *disagrees* and is the
+*more certain* side:
+
+```
+                 MT says        image says       what we commit
+   rotation:     +1.0°          −0.1°            MT  (gap < 10°, agree)
+   rotation:     +91° (FLIP)    −85°             image overrides  ← rescue
+   rotation:     +91° (FLIP,    −85°             keep MT, but
+                 confident)                       RAISE THE FLAG   ← limit
+   shift:        (12, 4) px     (60, 90) px      MT, unless the image
+                                                  is confident here too
+```
+
+Two rules keep this safe:
+
+- **The sign vote is the high-value part.** At run time the MT path's only
+  live "which way is up" signal is its own flip-ambiguity flag — its full
+  image sign-check is dormant. So the image's independent vote on a 180°
+  flip is genuinely new information, and a confident image *can* overturn a
+  weak-or-flagged MT rotation. That is the "rescue" row above.
+
+- **Translation is gated.** A shift override only happens if the image is
+  confident *about the shift itself* AND the two shifts differ by more than
+  a real margin. Otherwise we stay silent and keep MT. (The image's shift
+  confidence and MT's are measured on different scales, so we never let a
+  noisy image nudge a good MT translation.)
+
+**The golden rule:** a confident MT is never overwritten by a
+low-confidence image. The image can only rescue an MT that was already
+weak or already flagged.
+
+**The one known limit:** because the two confidence scores live on
+different baselines, a *confidently-wrong* MT flip is **flagged for review,
+not auto-corrected**. The tool tells you "these two disagree and I am not
+sure" rather than silently picking the image — same ABSTAIN spirit as
+everywhere else.
+
+---
+
 ## What if some sections have no microtubules?
 
 Not every dataset has MT graphs. For those, the rotation comes from cell
@@ -356,10 +411,12 @@ refuses to commit when even that is unclear), pairs the cut-ends with
 **Hungarian matching** including direction, **solves every section's
 position at once** so errors do not compound, and then applies a **smoothly
 bent warp** that is guarded against folds and whirlpools. Every joint gets
-an independent image-based confidence check. When no MTs are available, the
-shape of the **nuclear envelope** and the constellation of **organelles**
-play the same role. Joints the tool is not sure about are flagged, never
-silently stitched.
+an independent image-based confidence check. When the image volumes are
+present too, a separate image-only pose acts as a **second opinion** that
+can rescue a weak or flagged MT joint but never overrides a confident one.
+When no MTs are available at all, the shape of the **nuclear envelope** and
+the constellation of **organelles** play the same role. Joints the tool is
+not sure about are flagged, never silently stitched.
 
 ---
 

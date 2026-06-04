@@ -346,6 +346,47 @@ def run_stitch(
                 "    NOTE: flagged = needs human review, NOT proven wrong "
                 "(large rotations the pipeline can't auto-verify are flagged)."
             )
+
+        # Dual-chain cross-check: with volumes also present, the image RANSAC pose is an
+        # independent second estimate. Reconcile keeps MT unless the image disagrees AND
+        # is the more certain side (sign, or shift gated on the image's own confidence).
+        if has_vol:
+            from pandorica.stitch.image_pose import reconcile_image_mt
+
+            _say("")
+            _say("--- Dual-chain cross-check (MT vs image RANSAC; volumes present) ---")
+            xc_metric = method if method != "mi" else "ncc"
+            poses, xreports = reconcile_image_mt(
+                ds, poses, rows, metric=xc_metric, workers=workers, log=_say
+            )
+            xflag, xoverride = [], []
+            for r in xreports:
+                rs = "img" if r["rot_src"] == "img" else "MT "
+                ts = "img" if r["t_src"] == "img" else "MT "
+                notes = [n for n, b in (("sign", r["rot_conflict"]),
+                                        ("shift", r["t_conflict"])) if b]
+                note = f"  CONFLICT({'+'.join(notes)})" if notes else ""
+                _say(
+                    f"  {r['label']:>16}: MT={r['rot_mt']:+7.1f}° img={r['rot_img']:+7.1f}°"
+                    f" gap={r['rot_gap']:4.1f}° -> rot:{rs}  dt={r['dt_px']:4.0f}px"
+                    f" -> shift:{ts}  [mf={r['match_frac']:.2f} agree={r['agree']:.2f}]{note}"
+                )
+                if r["flagged"]:
+                    xflag.append(r["label"])
+                if r["rot_src"] == "img" or r["t_src"] == "img":
+                    xoverride.append(r["label"])
+            if xoverride:
+                _say(
+                    f"  [xcheck] image override committed on {len(xoverride)} "
+                    f"interface(s): {', '.join(xoverride)}"
+                )
+            if xflag:
+                _say(
+                    f"  [xcheck] {len(xflag)} interface(s) flagged (MT/image disagree): "
+                    f"{', '.join(xflag)} — verify visually."
+                )
+            else:
+                _say("  [xcheck] MT and image agree on every interface.")
     else:
         from pandorica.stitch.image_pose import image_only_poses
 
@@ -356,7 +397,7 @@ def run_stitch(
         _say("! rotational cue, so the rotation can be unreliable — VERIFY VISUALLY,")
         _say("! and prefer providing *_spatialGraph.am (MT-based) when possible.")
         _say("!" * 71)
-        _say("--- Image-only coarse poses (rotation search + block-match shift) ---")
+        _say("--- Image-only coarse poses (weighted-RANSAC rigid: rotation + shift) ---")
         poses = image_only_poses(
             ds, metric=method if method != "mi" else "ncc", workers=workers, log=_say
         )

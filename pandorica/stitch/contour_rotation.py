@@ -12,14 +12,19 @@
 """
 Image-only inter-section rotation from cell geometry (no microtubules).
 
-The image-only fallback's dense-intensity rotation search (``image_pose``) fails on
-near-circular cross-sections (C. elegans): the boundary-face NCC is at the noise
-floor (~0.05) at *every* angle, so its ``argmax`` invents large spurious rotations.
-Validated against the MT path on FemalePN, that search was wrong by 120–170° on
-three of four interfaces (it picked +170/−150/+145° where the true rotation was ~0°).
+A geometry **cross-check** for the image-only pose stage (``image_pose``). That stage
+picks rotation by image consensus (the swept angle whose block-match cells best fit one
+rigid transform), which is reliable where the cells carry a rotational cue but can be
+fooled on a near-circular (≈2-fold-symmetric) cross-section where a 180° flip scores
+almost as well. So ``image_pose`` cross-checks its angle against the independent estimate
+here and **flags** the interface on disagreement — it keeps its own RANSAC rotation
+either way (a review signal, not an override). Independence is the point: a plain
+boundary-face NCC ``argmax`` can sit at the noise floor at every angle (the failure that
+motivated this module — see tmp/coarse_warp/DISCOVERIES.md), so a pixel-similarity peak
+alone can't be trusted to pick the angle — geometry is steadier.
 
-This module recovers rotation from **geometry** instead, the same principle the MT
-path uses (match a constellation, not pixels) but with image-derived structures:
+It recovers rotation from **geometry**, the same principle the MT path uses (match a
+constellation, not pixels) but with image-derived structures:
 
 * **magnitude** — the nuclear-envelope outline. The nucleus is segmented (the large,
   smooth, low-local-variance central region), its boundary taken as a radial

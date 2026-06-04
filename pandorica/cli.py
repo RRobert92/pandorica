@@ -236,16 +236,15 @@ def _build_stitch_options() -> list[click.Option]:
                 )
             )
         else:
-            options.append(
-                click.Option(
-                    [f"--{flag}"],
-                    type=ann,
-                    default=default,
-                    required=required,
-                    show_default=True,
-                    help=help_text,
-                )
+            # click only enforces ``required`` when no ``default`` is passed at all;
+            # an explicit ``default=None`` silently satisfies it (the callback would
+            # then run with None). So omit ``default`` for required params.
+            opt_kwargs = dict(
+                type=ann, required=required, show_default=True, help=help_text,
             )
+            if has_default:
+                opt_kwargs["default"] = default
+            options.append(click.Option([f"--{flag}"], **opt_kwargs))
     return options
 
 
@@ -288,6 +287,7 @@ def _build_stitch_command() -> click.Command:
         params=_build_stitch_options(),
         callback=_stitch_callback,
         help=_stitch_short_help(),
+        no_args_is_help=True,  # bare ``pandorica stitch`` prints help, not an error
     )
 
 

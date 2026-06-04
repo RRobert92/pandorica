@@ -16,7 +16,7 @@ Provides the pluggable, contrast-robust, masked, subpixel matcher used by
 :mod:`.image_warp` for image-fill, parallelised over grid cells.
 """
 
-import multiprocessing as _mproc
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import cv2
@@ -162,9 +162,11 @@ def block_match(
     is given a big window may overlap MTs — similarity uses only its MT-free pixels
     (cell kept if ≥ ``min_free`` free with texture ≥ ``min_std``).
 
-    ``workers > 1`` matches grid cells across processes. Memory is bounded: the
-    workers operate on the (downsampled) face images only — each process holds one
-    copy of those small arrays, nothing volume-sized.
+    ``workers > 1`` matches grid cells across **threads** — ``cv2.matchTemplate``
+    and the numpy reductions release the GIL, so the ``ncc``/``grad`` metrics
+    parallelise with no process-spawn or pickling cost and share the face arrays
+    (memory stays flat). The pure-Python ``mi`` metric is GIL-bound, so it runs
+    effectively serially — fine, as it is the rare path.
 
     :return: ``(src, dst, conf)`` source / matched ``(x, y)`` (subpixel) + peakiness.
     """
@@ -191,13 +193,11 @@ def block_match(
         min_free,
     )
 
-    if workers and workers > 1 and len(cells) > workers:
-        ctx = _mproc.get_context("spawn")
-        chunk = max(1, len(cells) // (workers * 4))
-        with ctx.Pool(workers, initializer=_cell_init, initargs=args) as pool:
-            results = pool.map(_cell_work, cells, chunksize=chunk)
+    _cell_init(*args)
+    if workers and workers > 1 and len(cells) > 1:
+        with ThreadPoolExecutor(max_workers=min(int(workers), len(cells))) as ex:
+            results = list(ex.map(_cell_work, cells))
     else:
-        _cell_init(*args)
         results = [_cell_work(c) for c in cells]
 
     src, dst, conf = [], [], []
