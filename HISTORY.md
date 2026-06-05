@@ -5,6 +5,80 @@ All notable changes to pandorica are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.6] — 2026-06-05
+
+### Changed
+
+- **The CPD coarse rotation search now runs its seeds in parallel.** The
+  multi-seed CPD search is the dominant cost of MT-based stitching (profiling
+  put it at ~85% of the solve), and its angle seeds were evaluated one after
+  another. Because each seed's CPD EM is GIL-releasing numpy, the seed sweep
+  in `pandorica.stitch.coarse.cpd.cpd_rotation_search` now fans the seeds out
+  across a `ThreadPoolExecutor` (one worker per seed, capped at
+  `os.cpu_count()`). Results are **byte-identical** to the old serial sweep —
+  the seeds are independent, the EM is deterministic, and `map` preserves
+  order — so no stitch outcome changes. On an 11-section test stack
+  (10 interfaces, 12 seeds) the coarse stage dropped from 33.2 to 7.3 s per
+  interface (4.6×) and the full MT solve from 391 to 134 s (2.9×); machines
+  with more cores scale further, up to the seed count.
+
+### Added
+
+- **Live per-interface progress for the MT solve.** `stitch_sections` and
+  `register_section_stack` gained an optional `progress` callback that fires
+  once per interface, tagged with the current phase; the CLI now prints
+  `[coarse] interface k/n` then `[register] interface k/n` as the solve runs,
+  so a long stack streams progress instead of going silent until it returns.
+
+## [1.1.5] — 2026-06-04
+
+### Added
+
+- **Cross-section filament chaining.** New `pandorica/stitch/chain.py` reuses
+  the matcher's per-interface microtubule pairings to merge the per-section
+  spline IDs of one microtubule into a single global filament ID (union-find
+  over `(section, mt_id)`, unioning only across accepted interfaces and
+  breaking at flagged ones), plus block orientation, joint splitting, and
+  per-point/edge diagnostic labels (`chain_filaments`, `orient_chain_blocks`,
+  `split_chains_at_joints`, `compute_chain_labels`). The exported spatial
+  graph now has one connected spline per microtubule instead of one disjoint
+  spline per section. CLI and `StitchValidatorWidget` forward
+  `interface_id_pairs` / `interface_accepted` to the exporters.
+- **Spatial-graph inspector for napari.** A `SpatialGraphInspectorWidget`
+  (`pandorica/napari/_widget.py`, registered in `napari.yaml`) for inspecting
+  and filtering filaments and joints; the reader attaches per-edge properties
+  to the Shapes layer and can show joints as Points coloured by
+  `JointAngleDeg`.
+- **Image↔MT dual-chain cross-check.** `reconcile_image_mt` compares the
+  independent image-pose and MT (spatial-graph) rotation estimates per
+  interface and selectively overwrites an MT pose when the image is more
+  certain (gated translation overrides, with a detailed report). A
+  boundary-contour estimate in `contour_rotation.py` adds a second,
+  geometry-based opinion.
+- **Register compute-time breakdown and cross-check progress.** The CLI
+  splits the register stage into `mt-solve` / `cross-check` (MT path) or
+  `image-pose` (image-only) and reports each in the compute-time summary, and
+  the image-candidate harvest now prints a progress line per interface so the
+  cross-check no longer looks frozen.
+
+### Changed
+
+- **Image-pose stage rewrite (~5× faster on the test stack).** The image-only
+  coarse pose now uses a confidence-weighted RANSAC rigid fit that picks the
+  rotation by inlier support, abstains from the translation when the inlier
+  fraction is too low, and breaks branch ties with a central-disk NCC. The
+  block-matcher (`match.block_match`) switched from a per-call multiprocessing
+  pool to a `ThreadPoolExecutor`, avoiding process spawn / pickling overhead.
+
+### Fixed
+
+- **`pandorica stitch` crashed when run with no arguments.** The Click option
+  builder set both `required=True` and `default=None`, but Click does not
+  enforce `required` when a default is present, so a bare `pandorica stitch`
+  (or one missing `--input-dir`) reached the solver with `input_dir=None` and
+  crashed instead of showing usage. Required parameters now omit the default,
+  and the bare command prints help (`no_args_is_help`).
+
 ## [1.1.0] — 2026-05-31
 
 ### Added

@@ -27,7 +27,7 @@ stage through the multi-seed CPD search.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence
 
 from pandorica.stitch.coarse.coarse_hybrid import (
     hybrid_coarse,
@@ -79,6 +79,7 @@ def stitch_sections(
     qc_min_match_fraction: float = 0.3,
     qc_max_shift_incoherence_rho: float = 2.5,
     qc_max_tangent_deg: float = 20.0,
+    progress: Optional[Callable[[str, int, int], None]] = None,
     **match_kwargs,
 ) -> SerialStitchResult:
     """
@@ -100,6 +101,10 @@ def stitch_sections(
     :param intensity_min_angle: only gate on intensity for ``|angle|`` above this.
     :param warp_* / qc_*: TPS-warp and per-interface QC thresholds, forwarded to the
         base pipeline.
+    :param progress: optional ``(phase, k, n_interfaces)`` callback, fired once per
+        interface as it is solved. ``phase`` is ``"coarse"`` (rotation search) then
+        ``"register"`` (match + warp); lets a caller stream live progress for a long
+        stack instead of going silent until the whole solve returns.
     :param z_band_fraction / allow_scale / lambda_scale / lambda_smooth /
         match_kwargs: forwarded to the coarse + base pipeline.
     :return: a ``SerialStitchResult``. ``accepted`` requires the base pipeline to accept,
@@ -120,6 +125,9 @@ def stitch_sections(
         z_band_fraction=z_band_fraction,
         continuity_tol=continuity_tol,
         search_kwargs=search_kwargs,
+        progress=(
+            (lambda k, ntot, ang: progress("coarse", k, ntot)) if progress else None
+        ),
     )
     base = register_section_stack(
         coords_list,
@@ -135,6 +143,7 @@ def stitch_sections(
         qc_min_match_fraction=qc_min_match_fraction,
         qc_max_shift_incoherence_rho=qc_max_shift_incoherence_rho,
         qc_max_tangent_deg=qc_max_tangent_deg,
+        progress=(lambda k, ntot: progress("register", k, ntot)) if progress else None,
         **match_kwargs,
     )
 

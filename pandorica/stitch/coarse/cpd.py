@@ -29,6 +29,9 @@ Numerics: points are internally centred/scaled to O(1) (the Gaussian responsibil
 underflow at raw Å magnitudes ~10⁵); the transform is de-normalised on return.
 """
 
+import os
+
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
@@ -206,8 +209,9 @@ def cpd_rotation_search(
     # outlier breakdown: q=0.5 tolerates ~50% decoys while jitter only lifts the
     # residual mildly. Reported confidence still uses an NN-tol consensus count.
     tol = 1.0 * _median_nn(ref_xy)
-    cands = []  # (score, angle, n_inl, res) per seed
-    for seed in np.linspace(0.0, 360.0, n_seeds, endpoint=False):
+    seeds = np.linspace(0.0, 360.0, n_seeds, endpoint=False)
+
+    def _eval_seed(seed):  # -> (score, angle, n_inl, res)
         a = np.deg2rad(seed)
         Rs = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
         seeded = (mov_xy - mc) @ Rs.T + mc
@@ -219,7 +223,17 @@ def cpd_rotation_search(
         score = float(np.percentile(nn, 100.0 * inlier_quantile))
         n_inl, _ = _consensus(mapped, ref_xy, tol)
         angle = float(((_angle_of(res.R @ Rs) + 180.0) % 360.0) - 180.0)
-        cands.append((score, angle, n_inl, res))
+        return (score, angle, n_inl, res)
+
+    # The seeds are independent and the per-seed CPD EM is GIL-releasing numpy
+    # (dense [M,N] E-step), so a thread per seed is real parallelism. ``map``
+    # preserves input order, so ``cands`` is byte-identical to the serial sweep.
+    n_workers = min(int(n_seeds), os.cpu_count() or 1)
+    if n_workers > 1 and n_seeds > 1:
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            cands = list(ex.map(_eval_seed, seeds))
+    else:
+        cands = [_eval_seed(s) for s in seeds]
 
     cands.sort(key=lambda c: c[0])  # lowest residual first
     best_score, angle, n_inl, res = cands[0]

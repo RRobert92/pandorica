@@ -38,7 +38,7 @@ high-Z — so the mapping is handled in ``_face`` below.)
 """
 
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
@@ -226,6 +226,7 @@ def register_section_stack(
     qc_min_match_fraction: float = 0.3,
     qc_max_shift_incoherence_rho: float = 2.5,
     qc_max_tangent_deg: float = 20.0,
+    progress: Optional[Callable[[int, int], None]] = None,
     **match_kwargs,
 ) -> StitchResult:
     """
@@ -245,6 +246,8 @@ def register_section_stack(
         point-cloud coarse — essential for large/ambiguous rotations the MT
         endpoints cannot resolve from a cold start. ``None`` entries fall back to
         the point-cloud policy.
+    :param progress: optional ``(k, n_interfaces)`` callback fired at the start of
+        each interface's solve, so a long stack can stream live progress.
     :param match_kwargs: forwarded to ``matcher.match_sections`` (e.g. thresholds).
     :return: a ``StitchResult`` with absolute poses, per-interface records, and an
         overall accept flag (all interfaces certified).
@@ -260,6 +263,8 @@ def register_section_stack(
     results: List[InterfaceResult] = []
 
     for k in range(n - 1):
+        if progress is not None:
+            progress(k, n - 1)
         # Convention: top face of section k ↔ bottom face of section k+1.
         ref_eps = _face(coords_list[k], "top", z_band_fraction)
         mov_eps = _face(coords_list[k + 1], "bottom", z_band_fraction)

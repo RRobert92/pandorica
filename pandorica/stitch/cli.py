@@ -292,6 +292,11 @@ def run_stitch(
     t_solve = 0.0
     t_xcheck = 0.0
     if use_mt:
+        _say("--- Solving MT poses (coarse rotation -> register; live) ---")
+
+        def _solve_progress(phase, k, ntot):
+            _say(f"  [{phase}] interface {k + 1}/{ntot}")
+
         _ts = time.perf_counter()
         result = stitch_sections(
             coords,
@@ -299,6 +304,7 @@ def run_stitch(
             cpd_coarse=cpd_coarse,
             allow_scale=allow_scale,
             lambda_scale=lambda_scale,
+            progress=_solve_progress,
         )
         t_solve = time.perf_counter() - _ts
         poses = stitch.result_poses(result)
