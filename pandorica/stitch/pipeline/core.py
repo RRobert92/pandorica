@@ -60,11 +60,14 @@ from pandorica.stitch.transform.solver import (
     IDENTITY,
     apply_pose,
     invert_pose,
+    compose_poses,
     global_pose_refine,
+    make_pose,
 )
 from pandorica.stitch.matching.mt_transform import (
     fit_rigid_transform_2d,
 )
+from pandorica.stitch.coarse.rotation_search import global_rotation_search
 
 
 @dataclass
@@ -163,28 +166,39 @@ def _centroid_rotation_seed(angle, mov_eps) -> Pose:
     a = np.deg2rad(angle)
     R = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
     t = c - R @ c
-    return {"Angle": float(angle), "Tx": float(t[0]), "Ty": float(t[1]), "Scale": 1.0}
+    return make_pose(float(angle), float(t[0]), float(t[1]))
 
 
-def _evaluate_seed(seed, ref_eps, mov_eps, rho, allow_scale, match_kwargs):
+def _evaluate_seed(seed, ref_eps, mov_eps, rho, allow_scale, match_kwargs, fit=True):
     """
     Match under a coarse ``seed`` and return its quality + relative transform.
 
     Returns a dict with ``score`` (post-rigid residual + MT-tangent break),
     ``residual`` (ρ), ``match_fraction``, the matched points, and the recovered
     relative rigid ``rel`` (mov-local → ref-local). ``None`` if too few matches.
+
+    ``fit`` (default ``True``) re-fits a rigid/similarity ``rel`` from the MT
+    correspondences. Pass ``fit=False`` to keep the supplied ``seed`` *as* the
+    committed relative pose — used by the image-coarse path, where ``seed`` is
+    the per-interface image pose (translation + rotation + anisotropic scale in
+    its L-matrix) and the MT residual belongs in the warp, not in a re-fit rigid
+    (fitting one from MT endpoints overfits the spatially-varying baking field —
+    see project_coarse_fine_architecture).
     """
     mov_c = _apply_pose_to_endpoints(mov_eps, seed)
     _, rx, mxc, cf, id_pairs = match_sections(ref_eps, mov_c, rho, **match_kwargs)
     if len(rx) < 3:
         return None
     b_local = apply_pose(invert_pose(seed), mxc)
-    ang, tx, ty, sc = fit_rigid_transform_2d(rx, b_local, allow_scale=allow_scale)
-    rel = {"Angle": ang, "Tx": tx, "Ty": ty, "Scale": sc}
+    if fit:
+        ang, tx, ty, sc = fit_rigid_transform_2d(rx, b_local, allow_scale=allow_scale)
+        rel = make_pose(ang, tx, ty, sc)
+    else:
+        rel = dict(seed)
     residual = float(
         np.sqrt(((apply_pose(rel, b_local) - rx) ** 2).sum(1).mean()) / rho
     )
-    rot = {"Angle": ang, "Tx": 0.0, "Ty": 0.0, "Scale": 1.0}
+    rot = make_pose(rel["Angle"])
     tang = tangent_discontinuity_deg(
         _dirs_for(rx, ref_eps), apply_pose(rot, _dirs_for(mxc, mov_c))
     )
@@ -209,6 +223,25 @@ def _failed_interface(reason: str) -> InterfaceResult:
     qc = InterfaceQC(False, False, 0.0, np.inf, 0.0, reasons=[reason])
     return InterfaceResult(
         dict(IDENTITY), dict(IDENTITY), GuardedWarp(cert, 0.0, False, None), qc, {}, []
+    )
+
+
+def _warpless_interface(rel: Pose) -> InterfaceResult:
+    """An interface the image coarse aligns but the MTs don't match across.
+
+    Unlike :func:`_failed_interface` this is **not** a failure: the global pose is
+    already set by the image coarse, so the interface's QC passes (``accepted``);
+    there is simply no MT residual warp here, and the image-fill stage covers the
+    fine deformation. The warp is left un-accepted (``_rbf`` ``None`` → zero
+    displacement) so the exporter ignores it and uses the image-fill warp instead.
+    """
+    from pandorica.stitch.transform.diagnostics import FieldCertificate
+
+    cert = FieldCertificate(1.0, 0.0, 0.0, 0.05, 1.0, passed=False)
+    qc = InterfaceQC(True, False, 0.0, 0.0, 0.0,
+                     reasons=["image-coarse only (no MT match)"])
+    return InterfaceResult(
+        dict(rel), dict(rel), GuardedWarp(cert, 0.0, False, None), qc, {}, []
     )
 
 
@@ -310,7 +343,7 @@ def register_section_stack(
                 best = ident
             else:
                 pca = coarse_align(_xy(ref_eps), _xy(mov_eps), allow_scale=allow_scale)
-                pca_seed = {kk: pca[kk] for kk in ("Angle", "Tx", "Ty", "Scale")}
+                pca_seed = make_pose(pca["Angle"], pca["Tx"], pca["Ty"], pca["Scale"])
                 cand = [
                     r
                     for r in (
@@ -359,7 +392,7 @@ def register_section_stack(
 
         ref_dirs = _dirs_for(ref_xy, ref_eps)
         mov_dirs = _dirs_for(mov_xy_c, mov_eps_c)
-        rot_only = {"Angle": rel["Angle"], "Tx": 0.0, "Ty": 0.0, "Scale": 1.0}
+        rot_only = make_pose(rel["Angle"])
         mov_dirs_aligned = apply_pose(rot_only, mov_dirs) if len(mov_dirs) else mov_dirs
 
         qc = assess_interface(
@@ -384,3 +417,273 @@ def register_section_stack(
     )
     accepted = all(r.qc.accepted for r in results)
     return StitchResult(poses=poses, interfaces=results, accepted=accepted)
+
+
+_BOOTSTRAP_MAX_PASSES = 6
+_BOOTSTRAP_MIN_GAIN = 0.01
+
+
+def _apply_warp_to_eps(endpoints, warp):
+    """Copy boundary endpoints with their xy displaced by a fitted warp (id/dir kept)."""
+    out = []
+    for e in endpoints:
+        pos = e["pos"].copy()
+        pos[:2] = pos[:2] + warp.displacement(pos[:2][None, :])[0]
+        out.append({**e, "pos": pos})
+    return out
+
+
+def _bootstrap_correspondences(ref_eps, mov_c0, rho, match_kwargs, warp_kw):
+    """Discover the converged cross-gap MT correspondences by iteratively pre-warping
+    the moving endpoints, returning the best ``(ref_xy, conf, id_pairs)`` seen.
+
+    When the coarse pose leaves a spatially-varying residual, a single rigid-frame
+    match drops the displaced-but-correct pairs: the matcher's rigid-residual and
+    smoothness gates are tuned for tight (<1ρ) co-location, so partners sitting at
+    2–3ρ are rejected even though they are real continuations. Each pass fits the
+    guarded TPS warp on the matches it *did* find and applies it, which pulls the
+    remaining true partners back toward <1ρ so the SAME tight gates now accept them —
+    recovering both the chain and the warp's support **without loosening any gate**
+    (a false neighbour is not pulled coherently by a smooth field, so it still fails).
+
+    The loop stops when the match stops improving (so a tight coarse pose costs a
+    single pass — a no-op), when the guarded warp can find no safe field, or at the
+    pass cap. The caller re-fits one guard-safe warp from these pairs in the ORIGINAL
+    coarse frame, so the export still carries a single field per interface.
+
+    Returns ``(ref_xy, conf, id_pairs, first_frac)`` — the best match seen plus the
+    UN-bootstrapped first-pass fraction, which the caller keeps so the rotation rescue
+    still detects a collapse the bootstrap would otherwise mask above its gate.
+    """
+    movc = [dict(e) for e in mov_c0]
+    best = (np.empty((0, 2)), None, [])
+    best_frac, prev, first_frac = -1.0, -1.0, 0.0
+    for i in range(_BOOTSTRAP_MAX_PASSES):
+        _, rx, mxc, conf, idp = match_sections(ref_eps, movc, rho, **match_kwargs)
+        frac = conf.get("match_fraction", 0.0) if conf else 0.0
+        if i == 0:
+            first_frac = frac
+        if frac > best_frac:
+            best, best_frac = (rx, conf, idp), frac
+        if len(rx) < 4 or frac - prev < _BOOTSTRAP_MIN_GAIN:
+            break
+        prev = frac
+        w = fit_guarded_warp(mxc, rx, rho=rho, **warp_kw)
+        if not w.accepted:
+            break
+        movc = _apply_warp_to_eps(movc, w)
+    return (*best, first_frac)
+
+
+def register_warps_to_coarse(
+    coords_list,
+    coarse_poses: List[Pose],
+    z_band_fraction: float = 0.15,
+    warp_eps: float = 0.05,
+    warp_omega_max: float = 1.0,
+    warp_grid_n: int = 48,
+    warp_pad: float = 0.1,
+    qc_min_match_fraction: float = 0.3,
+    qc_max_shift_incoherence_rho: float = 2.5,
+    qc_max_tangent_deg: float = 20.0,
+    progress: Optional[Callable[[int, int], None]] = None,
+    **match_kwargs,
+) -> StitchResult:
+    """
+    Fit the per-interface MT residual warp RELATIVE to a supplied coarse pose chain.
+
+    This is the *fine* half of the coarse→fine pipeline (see
+    project_coarse_fine_architecture). The image coarse
+    (:func:`.image_pose.image_only_poses`) already fixes every section's **global**
+    pose — translation + rotation + anisotropic scale, carried in the L-matrix —
+    and that one pose is applied to BOTH the volume and the microtubule graph. This
+    stage adds only the spatially-varying remainder: for each gap it matches the
+    boundary MTs *in the already-coarse-aligned frame* and fits a foldover-guarded
+    TPS warp on the leftover (the baking deformation a single global affine cannot
+    represent).
+
+    Crucially, **no rigid/affine is re-fit from the MT correspondences** — fitting
+    one would force the spatially-varying field into a global transform and overfit
+    the anisotropy (the reverted MT-global-affine mistake). The committed relative
+    pose IS the image coarse, so the absolute poses returned are exactly
+    ``coarse_poses``; the matched moving MTs land in the reference frame through that
+    pose and the warp captures their residual displacement onto the reference MTs.
+
+    :param coords_list: per-section spatial graphs ``[N, 4]`` ``[id, x, y, z]``.
+    :param coarse_poses: absolute per-section image-coarse poses (length ``n``;
+        section 0 = gauge). Applied to image and MTs alike upstream.
+    :param warp_* / qc_*: TPS-warp and per-interface QC thresholds (as
+        :func:`register_section_stack`).
+    :param progress: optional ``(k, n_interfaces)`` callback fired per interface.
+    :param match_kwargs: forwarded to ``matcher.match_sections``.
+    :return: a ``StitchResult`` whose ``poses`` are ``coarse_poses`` unchanged and
+        whose per-interface ``warp`` holds the MT residual. MT-free interfaces get a
+        warp-less (but pose-accepted) record — the image-fill stage covers them.
+    """
+    n = len(coords_list)
+    if n < 2:
+        base = [dict(p) for p in coarse_poses] if coarse_poses else [dict(IDENTITY)]
+        return StitchResult(poses=base, interfaces=[], accepted=n <= 1)
+
+    rels = [
+        compose_poses(invert_pose(coarse_poses[k]), coarse_poses[k + 1])
+        for k in range(n - 1)
+    ]
+    results: List[InterfaceResult] = []
+    for k in range(n - 1):
+        if progress is not None:
+            progress(k, n - 1)
+        rel = rels[k]
+        ref_eps = _face(coords_list[k], "top", z_band_fraction)
+        mov_eps = _face(coords_list[k + 1], "bottom", z_band_fraction)
+        if len(ref_eps) < 2 or len(mov_eps) < 2:
+            results.append(_warpless_interface(rel))
+            continue
+
+        rho_k = _endpoint_rho(ref_eps)
+        mov_c0 = _apply_pose_to_endpoints(mov_eps, rel)
+        warp_kw = dict(eps=warp_eps, omega_max=warp_omega_max,
+                       grid_n=warp_grid_n, pad=warp_pad)
+        # Match in the already-coarse-aligned frame, bootstrapping the correspondences
+        # so a spatially-varying residual doesn't cost real cross-gap pairs (see
+        # _bootstrap_correspondences). A tight coarse pose converges in one pass.
+        ref_xy, conf, id_pairs, first_frac = _bootstrap_correspondences(
+            ref_eps, mov_c0, rho_k, match_kwargs, warp_kw
+        )
+        if conf is None or len(ref_xy) < 2:
+            results.append(_warpless_interface(rel))
+            continue
+
+        # Re-fit ONE guard-safe warp from the converged pairs in the ORIGINAL coarse
+        # frame (map each match back to its rel-posed moving position by MT id), so the
+        # export carries a single field per interface — the bootstrap only DISCOVERS
+        # the pairs; the warp and QC are then computed on the true, un-pre-warped
+        # residual. ref endpoints are never pre-warped, so ref_xy is already correct.
+        id_to_xy = {int(e["id"]): np.asarray(e["pos"][:2], float) for e in mov_c0}
+        mov_xy_c = np.array([id_to_xy[int(ip[1])] for ip in id_pairs])
+        # In the pre-warped frame the matched shift is ~0 (it would trivially pass the
+        # incoherence gate); recompute it on the real residual instead.
+        shifts = ref_xy - mov_xy_c
+        conf = {
+            **conf,
+            "match_fraction_single": float(first_frac),
+            "shift_incoherence_rho": (
+                float(np.linalg.norm(np.std(shifts, axis=0)) / rho_k)
+                if len(ref_xy) > 1 else np.inf
+            ),
+        }
+        warp = fit_guarded_warp(mov_xy_c, ref_xy, rho=rho_k, **warp_kw)
+
+        ref_dirs = _dirs_for(ref_xy, ref_eps)
+        mov_dirs = _dirs_for(mov_xy_c, mov_c0)
+        rot_only = make_pose(rel["Angle"])
+        mov_dirs_aligned = apply_pose(rot_only, mov_dirs) if len(mov_dirs) else mov_dirs
+
+        qc = assess_interface(
+            warp.certificate,
+            conf,
+            ref_dirs,
+            mov_dirs_aligned,
+            min_match_fraction=qc_min_match_fraction,
+            max_shift_incoherence_rho=qc_max_shift_incoherence_rho,
+            max_tangent_deg=qc_max_tangent_deg,
+        )
+        results.append(
+            InterfaceResult(dict(rel), dict(rel), warp, qc, conf, id_pairs)
+        )
+
+    accepted = all(r.qc.accepted for r in results)
+    return StitchResult(
+        poses=[dict(p) for p in coarse_poses], interfaces=results, accepted=accepted
+    )
+
+
+def _rescue_relative(coords_ref, coords_mov, z_band_fraction, search_kwargs,
+                     match_kwargs):
+    """Re-estimate one interface's relative pose from the MTs (rotation search +
+    rigid fit), to rescue an interface where the image coarse rotation failed.
+
+    Adoption is decided by the DIRECT criterion — does the re-estimated rotation make
+    the MTs actually match (its post-fit match fraction, the caller's gate) — not by
+    the rotation search's own ``confident`` flag, which is an unreliable proxy here: on
+    the real Monopoles sec01→sec02 the CPD angle was flagged *not* confident
+    (flip_ratio 1.00) yet it produced the best production match and was the correct
+    rescue. A wrong rotation cannot produce a good MT match, so the gate is the safety.
+
+    Returns ``(rel, match_fraction, mt_angle)`` or ``None`` when too few endpoints or
+    the search yields no usable fit. (The decoy-robust multi-seed CPD is the default
+    search; the full gated sweep is left out — it is prohibitively slow on a
+    thousand-endpoint bundle and the match gate already rejects a bad estimate.)
+    """
+    ref_eps = _face(coords_ref, "top", z_band_fraction)
+    mov_eps = _face(coords_mov, "bottom", z_band_fraction)
+    if len(ref_eps) < 3 or len(mov_eps) < 3:
+        return None
+    rho = _endpoint_rho(ref_eps)
+    est = global_rotation_search(ref_eps, mov_eps, rho,
+                                 **(search_kwargs or {"use_cpd": True}))
+    seed = _centroid_rotation_seed(est.angle, mov_eps)
+    best = _evaluate_seed(seed, ref_eps, mov_eps, rho, False, match_kwargs, fit=True)
+    if best is None:
+        return None
+    return best["rel"], float(best["match_fraction"]), float(est.angle)
+
+
+def rescue_coarse_poses(
+    coords_list,
+    coarse_poses,
+    match_fractions,
+    *,
+    z_band_fraction: float = 0.15,
+    match_gate: float = 0.3,
+    search_kwargs=None,
+    **match_kwargs,
+):
+    """Rescue interfaces where the image coarse rotation failed, using the MTs.
+
+    The image-driven coarse is reliable almost everywhere, but on an occasional
+    hard interface (large drift, low overlap, and — on MT-bundle samples — no
+    nuclear contour to cross-check) it can commit a grossly wrong rotation. The MT
+    match fraction is the detector: *a wrong rotation collapses the match*. Where
+    that match is below ``match_gate``, this re-estimates the rotation from the
+    (dense) MTs and **adopts it only when the MT estimate is confident AND it
+    clears the gate AND it beats the image's match** — so a rescue can never make
+    an interface worse. A genuinely sparse interface, or a correct large rotation
+    that already matched well, is left untouched.
+
+    :param match_fractions: per-interface MT match fraction from a first
+        :func:`register_warps_to_coarse` pass (length ``n-1``).
+    :param search_kwargs: forwarded to :func:`global_rotation_search` (e.g.
+        ``{"use_cpd": True, ...}`` for the decoy-robust multi-seed search).
+    :return: ``(poses, rescues)`` — the corrected absolute pose chain (unchanged
+        where nothing was rescued) and a list of
+        ``(k, image_angle, mt_angle, image_match, mt_match)`` for logging.
+    """
+    n = len(coords_list)
+    if n < 2:
+        return [dict(p) for p in coarse_poses], []
+    rels = [
+        compose_poses(invert_pose(coarse_poses[k]), coarse_poses[k + 1])
+        for k in range(n - 1)
+    ]
+    rescues = []
+    for k in range(n - 1):
+        if k >= len(match_fractions) or match_fractions[k] >= match_gate:
+            continue
+        out = _rescue_relative(
+            coords_list[k], coords_list[k + 1], z_band_fraction, search_kwargs,
+            match_kwargs,
+        )
+        if out is None:
+            continue
+        rel_mt, mf_mt, ang_mt = out
+        if mf_mt >= match_gate and mf_mt > match_fractions[k]:
+            img_ang = float(rels[k].get("Angle", 0.0))
+            rels[k] = rel_mt
+            rescues.append((k, img_ang, ang_mt, float(match_fractions[k]), mf_mt))
+    if not rescues:
+        return [dict(p) for p in coarse_poses], []
+    new_poses = [dict(coarse_poses[0])]
+    for k in range(n - 1):
+        new_poses.append(compose_poses(new_poses[-1], rels[k]))
+    return new_poses, rescues

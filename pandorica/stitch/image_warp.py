@@ -150,7 +150,7 @@ def image_residual_warps(
     invert_z: bool = False,
     grid: int = 16,
     half: int = 64,
-    search: int = 16,
+    search: int = 64,
     min_peakiness: float = 4.0,
     mask_radius_px: int = 24,
     omega_max: float = 0.3,
@@ -170,6 +170,12 @@ def image_residual_warps(
         maps), ``'mi'`` (mutual information; ~2× slower, helps only for
         cross-modality / contrast-mismatched faces).
     :param mt_warps: MT warps to pre-align before matching (``None`` = image-only).
+    :param search: block-match search radius (face px). The MT-free residual the fill
+        must catch — where the MT spline only extrapolates — is large (30-120 px on real
+        data: the corners/vesicles that visibly jump); a small window finds almost no
+        matches there, so the fill is ~identity and the jumps persist. ``64`` covers the
+        bulk of that residual; the diffeomorphism guard rejects the rare over-reaching
+        fit (so a too-large search degrades to identity, never a bad warp).
     :param workers: processes for cell matching (memory-safe — faces are small).
     :param omega_max: vorticity bound for the guarded fit (same softness knob).
     :return: list of ``GuardedWarp`` (some identity), one per interface.

@@ -40,6 +40,7 @@ from sklearn.neighbors import NearestNeighbors
 from pandorica.stitch.matching.mt_transform import (
     fit_rigid_transform_2d,
 )
+from pandorica.stitch.transform.solver import make_pose
 
 
 def _rot(angle_deg: float) -> np.ndarray:
@@ -111,7 +112,7 @@ def coarse_align(
     ref_xy = np.asarray(ref_xy, dtype=float)
     mov_xy = np.asarray(mov_xy, dtype=float)
     if len(ref_xy) < 2 or len(mov_xy) < 2:
-        return {"Angle": 0.0, "Tx": 0.0, "Ty": 0.0, "Scale": 1.0, "residual": np.inf}
+        return {**make_pose(), "residual": np.inf}
 
     base = _principal_angle(ref_xy) - _principal_angle(mov_xy)
     ref_mean, mov_mean = ref_xy.mean(0), mov_xy.mean(0)
@@ -130,11 +131,6 @@ def coarse_align(
         angle, tx, ty, scale = _icp_nn(ref_xy, mov_xy, init, refine_iters, allow_scale)
         resid = chamfer(apply_rigid_xy(mov_xy, angle, tx, ty, scale), ref_xy)
         if best is None or resid < best["residual"]:
-            best = {
-                "Angle": float(angle),
-                "Tx": float(tx),
-                "Ty": float(ty),
-                "Scale": float(scale),
-                "residual": resid,
-            }
+            best = {**make_pose(float(angle), float(tx), float(ty), float(scale)),
+                    "residual": resid}
     return best

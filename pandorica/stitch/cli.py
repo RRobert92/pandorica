@@ -290,23 +290,61 @@ def run_stitch(
     # --- poses: MT-based or image-only ------------------------------------- #
     t = time.perf_counter()
     t_solve = 0.0
-    t_xcheck = 0.0
+    t_coarse = 0.0
     if use_mt:
-        _say("--- Solving MT poses (coarse rotation -> register; live) ---")
 
         def _solve_progress(phase, k, ntot):
             _say(f"  [{phase}] interface {k + 1}/{ntot}")
 
-        _ts = time.perf_counter()
-        result = stitch_sections(
-            coords,
-            warp_omega_max=warp_omega,
-            cpd_coarse=cpd_coarse,
-            allow_scale=allow_scale,
-            lambda_scale=lambda_scale,
-            progress=_solve_progress,
-        )
-        t_solve = time.perf_counter() - _ts
+        if has_vol:
+            # COARSE -> FINE (default): the image fixes the global pose — translation,
+            # rotation, AND anisotropic scale — and that one pose is applied to the
+            # microtubules too; the MTs then only fit the fine residual warp on top of
+            # it (the spatially-varying baking deformation a single global affine
+            # cannot hold). The legacy MT point-cloud coarse + MT pose-solve is kept
+            # only as the no-volume fallback below.
+            from pandorica.stitch.image_pose import image_only_poses
+
+            _say(
+                "--- Coarse poses from image (rotation + shift + anisotropic scale; "
+                "applied to MTs) ---"
+            )
+            _say(
+                "    NOTE: the inter-section ROTATION is image-derived; the MT match "
+                "fraction below validates it (a wrong rotation collapses the match)."
+            )
+            _tc = time.perf_counter()
+            coarse_poses = image_only_poses(
+                ds, metric=method if method != "mi" else "ncc",
+                workers=workers, log=_say,
+            )
+            t_coarse = time.perf_counter() - _tc
+            _say("")
+            _say("--- MT fine residual warp (relative to the image coarse; live) ---")
+            _ts = time.perf_counter()
+            result = stitch_sections(
+                coords,
+                coarse_poses=coarse_poses,
+                warp_omega_max=warp_omega,
+                progress=_solve_progress,
+            )
+            t_solve = time.perf_counter() - _ts
+        else:
+            _say(
+                "--- No volumes: legacy MT-pose solve (coarse rotation -> register; "
+                "live) ---"
+            )
+            _ts = time.perf_counter()
+            result = stitch_sections(
+                coords,
+                warp_omega_max=warp_omega,
+                cpd_coarse=cpd_coarse,
+                allow_scale=allow_scale,
+                lambda_scale=lambda_scale,
+                progress=_solve_progress,
+            )
+            t_solve = time.perf_counter() - _ts
+
         poses = stitch.result_poses(result)
         mt_warps = stitch.result_warps(result)
         chain_pairs = [iface.id_pairs for iface in result.base.interfaces]
@@ -357,48 +395,18 @@ def run_stitch(
                 "(large rotations the pipeline can't auto-verify are flagged)."
             )
 
-        # Dual-chain cross-check: with volumes also present, the image RANSAC pose is an
-        # independent second estimate. Reconcile keeps MT unless the image disagrees AND
-        # is the more certain side (sign, or shift gated on the image's own confidence).
-        if has_vol:
-            from pandorica.stitch.image_pose import reconcile_image_mt
-
+        if getattr(result, "rescues", None):
             _say("")
-            _say("--- Dual-chain cross-check (MT vs image RANSAC; volumes present) ---")
-            xc_metric = method if method != "mi" else "ncc"
-            _tx = time.perf_counter()
-            poses, xreports = reconcile_image_mt(
-                ds, poses, rows, metric=xc_metric, workers=workers, log=_say
+            _say(
+                f"--- MT rotation rescue: {len(result.rescues)} interface(s) where "
+                "the image coarse rotation failed (the dense MTs re-estimated it) ---"
             )
-            t_xcheck = time.perf_counter() - _tx
-            xflag, xoverride = [], []
-            for r in xreports:
-                rs = "img" if r["rot_src"] == "img" else "MT "
-                ts = "img" if r["t_src"] == "img" else "MT "
-                notes = [n for n, b in (("sign", r["rot_conflict"]),
-                                        ("shift", r["t_conflict"])) if b]
-                note = f"  CONFLICT({'+'.join(notes)})" if notes else ""
+            for (k, img_a, mt_a, img_m, mt_m) in result.rescues:
                 _say(
-                    f"  {r['label']:>16}: MT={r['rot_mt']:+7.1f}° img={r['rot_img']:+7.1f}°"
-                    f" gap={r['rot_gap']:4.1f}° -> rot:{rs}  dt={r['dt_px']:4.0f}px"
-                    f" -> shift:{ts}  [mf={r['match_frac']:.2f} agree={r['agree']:.2f}]{note}"
+                    f"  {ds.interface_label(k):>16}: image {img_a:+.1f}° "
+                    f"(match {img_m * 100:.0f}%)  ->  MT {mt_a:+.1f}° "
+                    f"(match {mt_m * 100:.0f}%)"
                 )
-                if r["flagged"]:
-                    xflag.append(r["label"])
-                if r["rot_src"] == "img" or r["t_src"] == "img":
-                    xoverride.append(r["label"])
-            if xoverride:
-                _say(
-                    f"  [xcheck] image override committed on {len(xoverride)} "
-                    f"interface(s): {', '.join(xoverride)}"
-                )
-            if xflag:
-                _say(
-                    f"  [xcheck] {len(xflag)} interface(s) flagged (MT/image disagree): "
-                    f"{', '.join(xflag)} — verify visually."
-                )
-            else:
-                _say("  [xcheck] MT and image agree on every interface.")
     else:
         from pandorica.stitch.image_pose import image_only_poses
 
@@ -526,9 +534,11 @@ def run_stitch(
     _say(f"  load          : {t_load:7.1f} s")
     _say(f"  register      : {t_stitch:7.1f} s")
     if use_mt:
-        _say(f"    mt-solve    : {t_solve:7.1f} s")
         if has_vol:
-            _say(f"    cross-check : {t_xcheck:7.1f} s")
+            _say(f"    img-coarse  : {t_coarse:7.1f} s")
+            _say(f"    mt-warp     : {t_solve:7.1f} s")
+        else:
+            _say(f"    mt-solve    : {t_solve:7.1f} s")
     else:
         _say(f"    image-pose  : {t_solve:7.1f} s")
     _say(f"  image-fill    : {t_fill:7.1f} s")

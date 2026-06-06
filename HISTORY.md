@@ -5,6 +5,101 @@ All notable changes to pandorica are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.2.1] — 2026-06-06
+
+### Changed
+
+- **The fine MT warp now bootstraps its correspondences, recovering cross-gap
+  microtubules a single match drops.** Where the image coarse leaves a
+  *spatially-varying* residual (a few ρ, not a uniform offset), true MT partners
+  land at 2–3 ρ instead of the <1 ρ a tight interface shows, and the matcher's
+  rigid-residual and smoothness gates — tuned for near-rigid co-location — reject
+  those displaced-but-correct pairs. `register_warps_to_coarse` now iterates
+  match → fit guarded warp → re-match: each pass pre-warps the moving endpoints so
+  the true partners reach <1 ρ and the *unchanged* tight gates accept them
+  (a false neighbour is not pulled coherently by a smooth field, so it still
+  fails — the match plateaus at its true level rather than running away). The
+  bootstrap only *discovers* the correspondences; a single foldover-guarded warp
+  is then re-fit from them in the original coarse frame, so the export still
+  carries one field per interface. On a dense microtubule stack this lifted the
+  two weak interfaces from 35 % → 49 % and 42 % → 63 % matched while every healthy
+  interface held or improved, with no degradation or false-match runaway across
+  low-drift, large-rotation, and near-achiral stacks. The rotation rescue now
+  keys off the un-bootstrapped single-pass match so the bootstrap cannot lift a
+  collapsed interface above the gate and hide a grossly wrong rotation.
+
+### Fixed
+
+- **Microtubule-only (no-volume) exports no longer collapse the stitched graph
+  into a single plane.** The per-section Z offset used to stack the graph was
+  taken from the volume's slice count, which does not exist when stitching
+  spatial graphs without volumes — so every section landed at Z = 0 and the
+  microtubules piled onto one flat slab. The no-volume export path now derives
+  each section's thickness from its own microtubule Z-extent, so the sections
+  stack flush as they do with volumes.
+
+## [1.2.0] — 2026-06-05
+
+### Changed
+
+- **`pandorica stitch` is now an image-driven coarse→fine pipeline.** When a
+  stack has volumes, the global per-section pose — translation, rotation, **and
+  anisotropic scale** — is estimated from the image (`image_only_poses`) and
+  applied to *both* the volume and the microtubule graph; the microtubules then
+  fit only the fine residual warp on top of it (`register_warps_to_coarse`),
+  instead of the global pose being solved from MT correspondences. This matches
+  the serial-section physics: the diamond knife and the e-beam "baking" deform
+  each section partly as a global anisotropic stretch (which the image recovers
+  reliably) and partly in a spatially varying way (which a single affine cannot
+  hold, so it belongs in the MT-driven warp — fitting a global affine from MT
+  correspondences overfits it). The legacy MT point-cloud coarse + global pose
+  solve is retained only as the **no-volume fallback**, and the image↔MT
+  dual-chain reconcile is dropped from the default path (the image *is* the pose
+  now, not a cross-check). `run_stitch`'s signature is unchanged, so the CLI
+  flags and the `tardis_stitch` wrapper are unaffected.
+
+- **Block-match windows now scale with the boundary-face size.** Three
+  estimators — the coarse translation match, the anisotropic affine refine, and
+  the MT-free image-fill — used fixed pixel windows calibrated for ~1024 px
+  faces. At the production load downscale the faces are ~2048 px, so each cell
+  covered half the physical structure: this halved the RANSAC inlier agreement
+  (≈0.16 vs 0.32, destabilising the translation) and starved the affine fit so
+  the anisotropic scale never committed. The translation and affine
+  windows/grids now scale with the face (floored so ≤1024 px faces — and every
+  unit test — are byte-for-byte unchanged), and the image-fill search radius was
+  raised from 16 to 64 px. On a real chiral stack this lifted per-interface MT
+  match fractions from ~26–43 % to ~60–68 % (all clearing the QC gate), made the
+  anisotropic scale commit at the production resolution, and turned the
+  image-fill from ~0 to 4/4 interfaces filled.
+
+### Added
+
+- **Anisotropic-affine pose (the L-matrix superset).** A pose now stores its
+  full 2×2 linear part (`L00, L01, L10, L11`) as the source of truth — it
+  composes by matrix multiply and carries independent `(sx, sy)` scale and shear
+  that the polar `{Angle, Tx, Ty, Scale}` view cannot represent — with the polar
+  form derived for display and reconstructed when a pose has no `L`. The linear
+  part threads end-to-end (the solver, `centroid_pose` / `pose_to_pixel`, the GPU
+  and napari warp appliers, and the image affine refine), so the anisotropic
+  coarse scale reaches the exported volume and spatial graph.
+
+- **`register_warps_to_coarse` — the image-coarse fine seam.** Fits each
+  interface's foldover-guarded MT residual warp *relative to* a supplied
+  image-coarse pose chain, with no rigid/affine re-fit from the MT
+  correspondences. `stitch_sections` gained a `coarse_poses` parameter that
+  routes through it, `_evaluate_seed(fit=False)` keeps a supplied pose as the
+  committed relative transform, and MT-free interfaces yield a pose-accepted,
+  warp-less record (the image-fill covers them). New tests in
+  `tests/test_warps_to_coarse.py`.
+
+### Deprecated
+
+- **MT-derived global pose.** The microtubule point-cloud coarse, the MT global
+  pose solve (`global_pose_refine`, including its `allow_affine` mode), and the
+  image↔MT `reconcile_image_mt` cross-check are no longer used by
+  `pandorica stitch` when volumes are present — they run only on the no-volume
+  fallback. They remain in the library for now.
+
 ## [1.1.6] — 2026-06-05
 
 ### Changed

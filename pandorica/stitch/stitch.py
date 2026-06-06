@@ -647,6 +647,16 @@ def export_stitched(
     else:
         # No volume export: still need an XY offset/px for graph placement.
         offset = np.zeros(2)
+        # Without volumes there are no slice counts to stack the graph in Z, so
+        # every section would land at Z-offset 0 and collapse onto one plane.
+        # Use each section's own microtubule Z-extent as its thickness. Coords
+        # are physical (Å); divide by px so it stays in the slice-equivalent
+        # units the `z_off_slices * px` stack below expects (px == 1.0 here when
+        # no section carries a volume, so this is exactly the Å span).
+        for i, s in enumerate(dataset.sections):
+            if len(s.coords):
+                zc = s.coords[:, 3]
+                z_thickness[i] = float(zc.max() - zc.min()) / px
 
     # --------------------------- microtubules ---------------------------------
     # When per-interface id_pairs + accept flags are supplied, build a global

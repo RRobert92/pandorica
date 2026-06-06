@@ -37,7 +37,7 @@ from pandorica.stitch.transform.applier import (
     make_inverse_map,
     warp_volume_slicewise,
 )
-from pandorica.stitch.transform.solver import Pose
+from pandorica.stitch.transform.solver import Pose, make_pose
 
 
 def _center_rotation_pose(angle_deg: float, center: np.ndarray) -> Pose:
@@ -45,12 +45,7 @@ def _center_rotation_pose(angle_deg: float, center: np.ndarray) -> Pose:
     a = np.deg2rad(angle_deg)
     R = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
     t = center - R @ center
-    return {
-        "Angle": float(angle_deg),
-        "Tx": float(t[0]),
-        "Ty": float(t[1]),
-        "Scale": 1.0,
-    }
+    return make_pose(float(angle_deg), float(t[0]), float(t[1]))
 
 
 def _transform_image(img: np.ndarray, pose: Pose) -> np.ndarray:
