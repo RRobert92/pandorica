@@ -317,6 +317,32 @@ def test_rescue_recovers_no_anisotropy_when_isotropic():
     assert rescues[0][5] is None                       # no spurious anisotropy
 
 
+def test_cut_vertical_jog_drops_only_vertical_local_outlier():
+    # 16 pairs on a grid sharing a smooth coarse displacement, EXCEPT one NEAR-VERTICAL pair
+    # whose displacement deviates from its neighbourhood -> a local outlier -> cut. A shallow
+    # outlier (reliable tangent) is left for the direction-based split; a true pair in a
+    # uniformly-displaced (deformed) field is NOT cut (it agrees with its neighbours).
+    pos = np.array([[x, y] for x in range(4) for y in range(4)], float) * 3.0
+    shallow, vert = [1.0, 0.0], [0.05, 0.05]
+    out_pos = 5
+    id_pairs = [(i, i, 0.1) for i in range(16)]
+
+    dirs = np.tile(shallow, (16, 1)); dirs[out_pos] = vert
+    disp = np.tile([1.0, 0.0], (16, 1)); disp[out_pos] = [1.0, 6.0]   # deviates ~6ρ
+    out = core._cut_vertical_jog(id_pairs, pos + disp, pos, dirs, dirs, 1.0, 2.0, k=6)
+    assert out_pos not in [p[0] for p in out] and len(out) == 15      # vertical outlier cut
+
+    dirs2 = np.tile(shallow, (16, 1))                                 # same outlier, shallow
+    out2 = core._cut_vertical_jog(id_pairs, pos + disp, pos, dirs2, dirs2, 1.0, 2.0, k=6)
+    assert len(out2) == 16                                            # split judges shallow
+
+    smooth = np.tile([2.0, 0.0], (16, 1))                             # uniform 2ρ deformation
+    out3 = core._cut_vertical_jog(id_pairs, pos + smooth, pos, dirs, dirs, 1.0, 2.0, k=6)
+    assert len(out3) == 16                                            # no local outlier -> kept
+
+    assert len(core._cut_vertical_jog(id_pairs, pos + disp, pos, dirs, dirs, 1.0, 0.0, k=6)) == 16
+
+
 def test_evaluate_seed_fit_false_keeps_seed_as_rel():
     gt = _coarse_chain(2)
     coords = _stack(gt, m=16, seed=4)

@@ -90,6 +90,8 @@ def stitch_sections(
     intensity_min_angle: float = _INTENSITY_MIN_ANGLE_DEG,
     warp_eps: float = 0.05,
     warp_omega_max: float = 1.0,
+    warp_tangent_weight: float = 0.0,
+    cut_vertical_jog_rho: float = 2.0,
     warp_grid_n: int = 48,
     warp_pad: float = 0.1,
     qc_min_match_fraction: float = 0.3,
@@ -150,6 +152,8 @@ def stitch_sections(
             qc_min_match_fraction=qc_min_match_fraction,
             qc_max_shift_incoherence_rho=qc_max_shift_incoherence_rho,
             qc_max_tangent_deg=qc_max_tangent_deg,
+            warp_tangent_weight=warp_tangent_weight,
+            cut_vertical_jog_rho=cut_vertical_jog_rho,
         )
         base = register_warps_to_coarse(
             coords_list, coarse_poses,
@@ -229,6 +233,8 @@ def stitch_sections(
             lambda_smooth=lambda_smooth,
             warp_eps=warp_eps,
             warp_omega_max=warp_omega_max,
+            warp_tangent_weight=warp_tangent_weight,
+            cut_vertical_jog_rho=cut_vertical_jog_rho,
             warp_grid_n=warp_grid_n,
             warp_pad=warp_pad,
             qc_min_match_fraction=qc_min_match_fraction,

@@ -149,6 +149,8 @@ def run_stitch(
     image_fill: bool = True,
     method: str = "ncc",
     warp_omega: float = 0.3,
+    warp_tangent_weight: float = 0.4,
+    cut_vertical_jog_rho: float = 2.0,
     zblend: bool = True,
     cpd_coarse: bool = True,
     downscale: int = 1,
@@ -174,6 +176,15 @@ def run_stitch(
         ``'grad'`` (NCC on edge maps), ``'mi'`` (mutual information; ~2× slower,
         helps only for cross-modality / contrast-mismatched faces).
     :param warp_omega: TPS vorticity bound (lower = smoother / fewer whirlpools).
+    :param warp_tangent_weight: gentle tangent-continuity term in the fine warp (0 = off,
+        ~0.4 = gentle). Nudges matched SHALLOW-MT stubs toward continuing smoothly across the
+        seam (minimises "stairs"), staying subordinate to the vorticity/detJ guard so it never
+        forces a whirlpool nor smooths a wrong (near-vertical) match into a convincing fake.
+    :param cut_vertical_jog_rho: cut a NEAR-VERTICAL matched pair from chaining when its
+        residual lateral jog (after coarse+warp) exceeds this many ρ (``0`` = off). Such pairs
+        have no reliable in-plane direction, so the direction-based chain split can't judge
+        them; a large jog means two different microtubules were joined. Conservative (``2.0``):
+        on a healthy stack no near-vertical pair clears it.
     :param zblend: Z-varying symmetric warp (else one warp per section).
     :param cpd_coarse: CPD multi-seed coarse rotation search (decoy-/±90°-robust).
     :param downscale: integer volume decimation (1 = full resolution).
@@ -230,6 +241,8 @@ def run_stitch(
         f"image_fill     : {image_fill}",
         f"method         : {method}",
         f"warp_omega     : {warp_omega}",
+        f"warp_tan_weight: {warp_tangent_weight}",
+        f"cut_vert_jog_ρ : {cut_vertical_jog_rho}",
         f"zblend         : {zblend}",
         f"cpd_coarse     : {cpd_coarse}",
         f"use_gpu        : {use_gpu}   (resolved device: {device})",
@@ -332,6 +345,8 @@ def run_stitch(
                 coords,
                 coarse_poses=coarse_poses,
                 warp_omega_max=warp_omega,
+                warp_tangent_weight=warp_tangent_weight,
+                cut_vertical_jog_rho=cut_vertical_jog_rho,
                 progress=_solve_progress,
             )
             t_solve = time.perf_counter() - _ts
@@ -344,6 +359,8 @@ def run_stitch(
             result = stitch_sections(
                 coords,
                 warp_omega_max=warp_omega,
+                warp_tangent_weight=warp_tangent_weight,
+                cut_vertical_jog_rho=cut_vertical_jog_rho,
                 cpd_coarse=cpd_coarse,
                 allow_scale=allow_scale,
                 lambda_scale=lambda_scale,

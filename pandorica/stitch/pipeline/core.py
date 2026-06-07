@@ -247,6 +247,41 @@ def _warpless_interface(rel: Pose) -> InterfaceResult:
     )
 
 
+# Near-vertical stubs (|in-plane tangent| below this) have no usable in-plane direction, so
+# split_chains cannot judge whether they continue — it judges by direction. A wrong such match
+# is two different MTs joined by a lateral jog. We catch those by POSITION instead.
+_CUT_VERTICAL_MIN_XY = 0.2
+
+
+def _cut_vertical_jog(id_pairs, mov_xy, ref_xy, mov_dirs, ref_dirs, rho, jog_rho, k=8):
+    """Drop near-vertical matched pairs whose coarse displacement DISAGREES with its local
+    neighbourhood by more than ``jog_rho`` × ρ — the split-blind wrong matches.
+
+    A wrong match (two different MTs joined) is a LOCAL OUTLIER: its coarse displacement
+    ``mov − ref`` deviates from the smooth field its neighbours follow. The *absolute* jog does
+    NOT separate wrong from right — a true pair in a deformed region also has a large coarse jog
+    (and the warp bootstrap recovers it), so cutting on absolute jog also cuts good pairs (even
+    on healthy stacks). Only the deviation from the LOCAL consensus is specific to a bad match.
+    Restricted to NEAR-VERTICAL pairs: a reliable in-plane tangent would let the direction-based
+    chain split judge the pair instead. Conservative; ``jog_rho <= 0`` disables it.
+    """
+    n = len(id_pairs)
+    if jog_rho <= 0 or n < k + 2 or len(mov_xy) != n or len(ref_xy) != n:
+        return id_pairs
+    ref = np.asarray(ref_xy, float)
+    disp = (np.asarray(mov_xy, float) - ref) / max(rho, 1e-9)
+    _, idx = NearestNeighbors(n_neighbors=k + 1).fit(ref).kneighbors(ref)
+    resid = np.array([
+        np.linalg.norm(disp[i] - np.median(disp[idx[i, 1:]], axis=0)) for i in range(n)
+    ])
+    sv = (np.linalg.norm(np.asarray(mov_dirs, float), axis=1)
+          if len(mov_dirs) == n else np.ones(n))
+    dv = (np.linalg.norm(np.asarray(ref_dirs, float), axis=1)
+          if len(ref_dirs) == n else np.ones(n))
+    drop = ((sv < _CUT_VERTICAL_MIN_XY) | (dv < _CUT_VERTICAL_MIN_XY)) & (resid > jog_rho)
+    return [ip for ip, d in zip(id_pairs, drop) if not d]
+
+
 def register_section_stack(
     coords_list,
     allow_scale: bool = False,
@@ -256,6 +291,8 @@ def register_section_stack(
     coarse_angles=None,
     warp_eps: float = 0.05,
     warp_omega_max: float = 1.0,
+    warp_tangent_weight: float = 0.0,
+    cut_vertical_jog_rho: float = 2.0,
     warp_grid_n: int = 48,
     warp_pad: float = 0.1,
     qc_min_match_fraction: float = 0.3,
@@ -381,7 +418,13 @@ def register_section_stack(
         # its (possibly ambiguous) transform as strongly in the global solve.
         weights.append(conf.get("match_fraction", 0.0) ** 2)
 
-        # Residual warp on top of the selected relative rigid.
+        ref_dirs = _dirs_for(ref_xy, ref_eps)
+        mov_dirs = _dirs_for(mov_xy_c, mov_eps_c)
+        rot_only = make_pose(rel["Angle"])
+        mov_dirs_aligned = apply_pose(rot_only, mov_dirs) if len(mov_dirs) else mov_dirs
+
+        # Residual warp on top of the selected relative rigid (with the gentle, guarded
+        # tangent-continuity term on reliable shallow-MT stubs).
         warp = fit_guarded_warp(
             apply_pose(rel, B),
             A,
@@ -390,12 +433,10 @@ def register_section_stack(
             omega_max=warp_omega_max,
             grid_n=warp_grid_n,
             pad=warp_pad,
+            src_tan=mov_dirs_aligned,
+            dst_tan=ref_dirs,
+            tangent_weight=warp_tangent_weight,
         )
-
-        ref_dirs = _dirs_for(ref_xy, ref_eps)
-        mov_dirs = _dirs_for(mov_xy_c, mov_eps_c)
-        rot_only = make_pose(rel["Angle"])
-        mov_dirs_aligned = apply_pose(rot_only, mov_dirs) if len(mov_dirs) else mov_dirs
 
         qc = assess_interface(
             warp.certificate,
@@ -406,8 +447,12 @@ def register_section_stack(
             max_shift_incoherence_rho=qc_max_shift_incoherence_rho,
             max_tangent_deg=qc_max_tangent_deg,
         )
+        cut_pairs = _cut_vertical_jog(
+            best.get("id_pairs", []), apply_pose(rel, B), A,
+            mov_dirs_aligned, ref_dirs, rho_k, cut_vertical_jog_rho,
+        )
         results.append(
-            InterfaceResult(coarse_pose, rel, warp, qc, conf, best.get("id_pairs", []))
+            InterfaceResult(coarse_pose, rel, warp, qc, conf, cut_pairs)
         )
 
     poses = global_pose_refine(
@@ -488,6 +533,8 @@ def register_warps_to_coarse(
     qc_min_match_fraction: float = 0.3,
     qc_max_shift_incoherence_rho: float = 2.5,
     qc_max_tangent_deg: float = 20.0,
+    warp_tangent_weight: float = 0.0,
+    cut_vertical_jog_rho: float = 2.0,
     progress: Optional[Callable[[int, int], None]] = None,
     **match_kwargs,
 ) -> StitchResult:
@@ -574,12 +621,19 @@ def register_warps_to_coarse(
                 if len(ref_xy) > 1 else np.inf
             ),
         }
-        warp = fit_guarded_warp(mov_xy_c, ref_xy, rho=rho_k, **warp_kw)
-
         ref_dirs = _dirs_for(ref_xy, ref_eps)
         mov_dirs = _dirs_for(mov_xy_c, mov_c0)
         rot_only = make_pose(rel["Angle"])
         mov_dirs_aligned = apply_pose(rot_only, mov_dirs) if len(mov_dirs) else mov_dirs
+
+        # The tangent-continuity term (gentle, guarded) nudges matched shallow-MT stubs toward
+        # continuity across the seam; near-vertical stubs (unreliable in-plane tangent) are
+        # skipped inside fit_guarded_warp, and the vorticity/detJ guard stays authoritative.
+        warp = fit_guarded_warp(
+            mov_xy_c, ref_xy, rho=rho_k,
+            src_tan=mov_dirs_aligned, dst_tan=ref_dirs,
+            tangent_weight=warp_tangent_weight, **warp_kw,
+        )
 
         qc = assess_interface(
             warp.certificate,
@@ -589,6 +643,12 @@ def register_warps_to_coarse(
             min_match_fraction=qc_min_match_fraction,
             max_shift_incoherence_rho=qc_max_shift_incoherence_rho,
             max_tangent_deg=qc_max_tangent_deg,
+        )
+        # Cut split-blind wrong matches: near-vertical pairs with a large residual lateral jog
+        # (split_chains can't judge them by direction). Conservative — only the genuine outliers.
+        id_pairs = _cut_vertical_jog(
+            id_pairs, mov_xy_c, ref_xy, mov_dirs_aligned, ref_dirs, rho_k,
+            cut_vertical_jog_rho,
         )
         results.append(
             InterfaceResult(dict(rel), dict(rel), warp, qc, conf, id_pairs)

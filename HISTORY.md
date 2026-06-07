@@ -5,6 +5,54 @@ All notable changes to pandorica are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.4.0] — 2026-06-07
+
+### Added
+
+- **The MT rescue now recovers a failed interface's *anisotropy*, not just its rotation.**
+  The image coarse fits each interface's anisotropic stretch (`aniso=(sx,sy)`) and that stretch
+  is applied to both the volume and the microtubules — *except* on an interface whose image
+  coarse fails catastrophically (no nuclear contour / near-circular symmetry → a grossly wrong
+  rotation, e.g. −140°). The MT rotation-rescue corrected the rotation there but left the
+  interface isotropic, so its real ~10–14 % stretch was applied **nowhere**: the sections did
+  not line up (a visible gap), and the residual warp had to absorb the whole stretch, tripping
+  the vorticity guard and being rejected. The rescue now, after locking the rotation, fits an
+  anisotropic affine to the **dense bootstrapped** MT correspondences (the stretch lives in the
+  peripheral MTs, which only match once the warp bootstrap pulls them in) and adopts it only
+  when the residual stretch is genuine (> 5 %) **and** it improves the match — the symmetric
+  inverse of the scale-gate, which *drops* a bad image scale. On a dense stack the worst
+  interface recovered `aniso=(1.01, 0.95)`, its match rose 37 % → 83 %, and its residual warp
+  dropped under the guard so it now **passes** (rejected → accepted), closing ~72 % of the
+  boundary gap. The gate stays clean — a healthy interface's residual stretch is ~1 % (the image
+  already applied its aniso), well under the gate, so the recovery never fires there.
+
+- **A gentle, guarded tangent-continuity term in the fine warp (`--warp-tangent-weight`).**
+  The fine warp aligned matched microtubule-stub *positions* but not their *directions*, so a
+  matched pair could be positionally aligned yet still kink ("stair") at the seam. The warp now
+  optionally adds tangent-step correspondences that pull each matched **shallow**-MT stub's
+  in-plane tangent partway toward continuing smoothly across the seam. It is soft (default weight
+  `0.4`) and stays subordinate to the vorticity/detJ guard, so it never forces a whirlpool — and
+  it never fully erases a kink, so a *wrongly* matched pair keeps a residual stair rather than
+  being smoothed into a convincing fake. Only pairs with a reliable in-plane tangent participate
+  (`|tan_xy| > 0.2`); near-vertical stubs — which have no usable in-plane direction and no
+  in-plane stair to begin with — are left alone. It reduces the per-joint tangent discontinuity
+  where there is a systematic small kink (one interface: mean 10.6° → 4.4°), never newly rejects
+  a warp, and is off at `0`.
+
+- **Near-vertical wrong matches the chain split can't judge are now cut as local outliers
+  (`--cut-vertical-jog-rho`).** The chain split severs a joint when the two microtubule halves
+  point different ways — but a near-vertical stub has no reliable in-plane direction, so split is
+  blind to it, and a wrong such match (two different MTs joined by a lateral jog) survived. The
+  fine-warp stage now drops, before chaining, any near-vertical matched pair (in-plane tangent
+  magnitude below `0.2` on either side) whose coarse displacement **disagrees with its local
+  neighbourhood** by more than a threshold (default `2ρ`; `0` disables). The local-consensus
+  test matters: a wrong match is a *local outlier*, whereas a true pair sitting in a deformed
+  region also has a large *absolute* jog (and the warp bootstrap recovers it) — so cutting on
+  absolute jog also removes good pairs, while the deviation from the smooth local field is
+  specific to a bad match. It fires only a handful of times per interface (≈15 across a 10-section
+  dense stack) — a small correctness win that removes the split-blind stairs without touching the
+  well-matched bulk.
+
 ## [1.3.0] — 2026-06-07
 
 ### Fixed
