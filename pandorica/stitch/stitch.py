@@ -126,6 +126,7 @@ def interface_rows(result, dataset: Dataset) -> List[Dict]:
             "tangent_deg": iface.qc.tangent_discontinuity_deg,
             "warp_ok": bool(iface.warp.accepted),
             "qc_ok": bool(iface.qc.accepted),
+            "chained": bool(iface.qc.chainable),
             "reasons": "; ".join(iface.qc.reasons),
         }
         rec = result.hybrid.records[k] if k < len(result.hybrid.records) else None

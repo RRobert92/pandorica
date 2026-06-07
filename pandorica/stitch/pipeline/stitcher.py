@@ -37,6 +37,7 @@ from pandorica.stitch.pipeline.core import (
     register_section_stack,
     register_warps_to_coarse,
     rescue_coarse_poses,
+    gate_coarse_scale,
     StitchResult,
 )
 from pandorica.stitch.pipeline.intensity_qc import (
@@ -66,6 +67,10 @@ class SerialStitchResult:
     # MT rotation rescues (image-coarse path only): per entry
     # ``(k, image_angle, mt_angle, image_match, mt_match)``.
     rescues: List = field(default_factory=list)
+    # MT scale-gates (image-coarse path only): interfaces where the image scale was
+    # dropped because rotation-only matched the MTs better. Per entry
+    # ``(k, image_det, full_match, rot_match)``.
+    scale_gates: List = field(default_factory=list)
 
 
 def stitch_sections(
@@ -128,6 +133,7 @@ def stitch_sections(
         intensity-verified (when images are supplied).
     """
     rescues: List = []
+    scale_gates: List = []
     if coarse_poses is not None:
         # Image-coarse mode (the coarse→fine default): the global pose — translation,
         # rotation, anisotropic scale — is already fixed by the image and applied to
@@ -169,7 +175,17 @@ def stitch_sections(
             z_band_fraction=z_band_fraction, match_gate=qc_min_match_fraction,
             search_kwargs=rescue_sk, **match_kwargs,
         )
-        if rescues:
+        # Scale-gate: drop an image-coarse scale the MTs reject (rotation-only matches
+        # clearly better). The affine refine can overfit a both-axes stretch that the
+        # rotation rescue above never catches — such an interface still matches above the
+        # gate, it just warps the volume corner. Runs on the (possibly rescued) chain;
+        # the two passes target disjoint interfaces.
+        coarse_poses, scale_gates = gate_coarse_scale(
+            coords_list, list(coarse_poses),
+            z_band_fraction=z_band_fraction, match_gate=qc_min_match_fraction,
+            **match_kwargs,
+        )
+        if rescues or scale_gates:
             base = register_warps_to_coarse(
                 coords_list, coarse_poses,
                 progress=(
@@ -252,4 +268,5 @@ def stitch_sections(
         intensity=intensity,
         accepted=accepted,
         rescues=rescues,
+        scale_gates=scale_gates,
     )

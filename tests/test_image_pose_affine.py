@@ -86,6 +86,42 @@ def test_ransac_affine_rejects_outliers():
 
 
 # --------------------------------------------------------------------------- #
+# _clamp_affine: physical guard on the committed residual-affine
+# --------------------------------------------------------------------------- #
+def test_clamp_affine_reins_over_area():
+    # A both-axes inflation (det 1.32 — the overfit two adjacent EM sections cannot
+    # show) is pulled back into the det band, keeping its orientation and anisotropy
+    # DIRECTION (the ratio is preserved by the isotropic rescale).
+    A = np.diag([1.20, 1.10])
+    A_c, changed = ip._clamp_affine(A)
+    assert changed
+    assert np.linalg.det(A_c) <= ip._AFFINE_DET_BAND[1] + 1e-9
+    # still anisotropic (a real stretch direction survives, only the area is reined)
+    sv = np.linalg.svd(A_c, compute_uv=False)
+    assert sv.max() / sv.min() > 1.0
+
+
+def test_clamp_affine_leaves_physical_aniso_untouched():
+    # A genuine mild aniso/compression (det 0.94, both singular values inside the band
+    # — the Monopoles sec10->sec11 regime that HELPS the MTs) passes through unchanged.
+    A = _R(7.0) @ np.diag([1.02, 0.92])
+    A_c, changed = ip._clamp_affine(A)
+    assert not changed
+    assert np.allclose(A_c, A, atol=1e-6)
+
+
+def test_affine_refine_clamps_extreme_stretch():
+    # End-to-end through the refine: an extreme planted stretch (det 1.44) is committed
+    # only up to the physical band, not at its raw overfit magnitude.
+    fixed = _texture(256, seed=8)
+    moving = _render(fixed, np.diag([1.20, 1.20]), np.array([5.0, -3.0]))
+    out = ip._affine_refine(fixed, moving, 0.0, np.array([128.0, 128.0]), **_MK)
+    assert out is not None
+    L, _shift, _sv, _n = out
+    assert np.linalg.det(L) <= ip._AFFINE_DET_BAND[1] + 1e-6
+
+
+# --------------------------------------------------------------------------- #
 # _affine_refine on a textured face (ang=0 isolates the fit from angle search)
 # --------------------------------------------------------------------------- #
 _MK = dict(metric="ncc", grid=12, search=40, workers=2)

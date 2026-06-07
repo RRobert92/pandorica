@@ -363,7 +363,7 @@ class StitchValidatorWidget(QWidget):
             warps = stitch.result_warps(self.result)
             chain_pairs = [iface.id_pairs for iface in self.result.base.interfaces]
             chain_accepted = [
-                bool(iface.qc.accepted) for iface in self.result.base.interfaces
+                bool(iface.qc.chainable) for iface in self.result.base.interfaces
             ]
         image_warps = None
         if self.image_fill_cb.isChecked():
@@ -1554,3 +1554,193 @@ class SpatialGraphInspectorWidget(QWidget):
 
     def _warn(self, msg: str) -> None:
         QMessageBox.warning(self, "Spatial Graph Inspector", msg)
+
+
+class WarpMatchInspectorWidget(QWidget):
+    """Load a ``stitch_inspect.npz`` (from ``pandorica stitch --save-inspect``) and
+    overlay, per interface, the MT match residuals + the warp field + its ``|curl|``.
+
+    The bundle is written once by the (slow) CLI stitch; this widget only renders it,
+    so you can scrub interfaces and see exactly which matches / warp regions misbehave
+    without re-running anything. Coordinates are the graph output frame (Å); napari's
+    (row, col) = (y, x), so x/y are swapped on display.
+    """
+
+    def __init__(self, napari_viewer):
+        super().__init__()
+        self.viewer = napari_viewer
+        self._path: Optional[str] = None
+        self._z = None
+        self._meta: List[dict] = []
+        self._layers: List = []
+        self._build_ui()
+
+    # ---- UI -------------------------------------------------------------- #
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+
+        box = QGroupBox("File")
+        f = QFormLayout(box)
+        self.file_lbl = QLabel("(none)")
+        self.file_lbl.setWordWrap(True)
+        browse = QPushButton("Browse .npz…")
+        browse.clicked.connect(self._browse)
+        load_btn = QPushButton("Load")
+        load_btn.clicked.connect(self._load)
+        f.addRow(browse, self.file_lbl)
+        f.addRow(load_btn)
+        layout.addWidget(box)
+
+        box = QGroupBox("Interface")
+        f = QFormLayout(box)
+        self.iface_combo = QComboBox()
+        self.iface_combo.currentIndexChanged.connect(self._apply_view)
+        f.addRow("Interface", self.iface_combo)
+        layout.addWidget(box)
+
+        box = QGroupBox("Overlays")
+        f = QFormLayout(box)
+        self.cb_curl = QCheckBox("|curl| heatmap")
+        self.cb_curl.setChecked(True)
+        self.cb_curl.stateChanged.connect(self._apply_view)
+        self.cb_match = QCheckBox("MT match residual lines (green=tight, red=large)")
+        self.cb_match.setChecked(True)
+        self.cb_match.stateChanged.connect(self._apply_view)
+        self.cb_quiver = QCheckBox("Warp displacement field")
+        self.cb_quiver.setChecked(False)
+        self.cb_quiver.stateChanged.connect(self._apply_view)
+        f.addRow(self.cb_curl)
+        f.addRow(self.cb_match)
+        f.addRow(self.cb_quiver)
+        self.vec_scale = QDoubleSpinBox()
+        self.vec_scale.setRange(1.0, 100.0)
+        self.vec_scale.setValue(10.0)
+        self.vec_scale.setSuffix(" × warp")
+        self.vec_scale.valueChanged.connect(self._apply_view)
+        f.addRow("Vector exaggeration", self.vec_scale)
+        layout.addWidget(box)
+
+        self.stats = QTextEdit()
+        self.stats.setReadOnly(True)
+        self.stats.setMaximumHeight(150)
+        layout.addWidget(self.stats)
+        layout.addStretch(1)
+
+    # ---- Actions --------------------------------------------------------- #
+    def _browse(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open inspection bundle (.npz)",
+            filter="Inspection bundle (*.npz)",
+        )
+        if path:
+            self._path = path
+            self.file_lbl.setText(os.path.basename(path))
+
+    def _load(self) -> None:
+        if not self._path:
+            self._warn("Pick a stitch_inspect.npz first.")
+            return
+        try:
+            import json
+
+            self._z = np.load(self._path, allow_pickle=False)
+            self._meta = json.loads(str(self._z["manifest"]))["interfaces"]
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(
+                self, "Read failed", f"{exc}\n\n{traceback.format_exc()}"
+            )
+            return
+        self.iface_combo.blockSignals(True)
+        self.iface_combo.clear()
+        for m in self._meta:
+            if m["chainable"] and not m["qc_accepted"]:
+                tag = "  [warp rejected · MTs chained]"
+            elif not m["chainable"]:
+                tag = "  [not chained]"
+            else:
+                tag = ""
+            self.iface_combo.addItem(f"{m['name']}{tag}")
+        self.iface_combo.blockSignals(False)
+        if self._meta:
+            self.iface_combo.setCurrentIndex(0)
+        self._apply_view()
+
+    def _apply_view(self) -> None:
+        self._clear()
+        if self._z is None or not self._meta:
+            return
+        k = self.iface_combo.currentIndex()
+        if k < 0 or k >= len(self._meta):
+            return
+        m = self._meta[k]
+        try:
+            ext = np.asarray(self._z[f"if{k}_extent"], float)  # [xmin,xmax,ymin,ymax]
+            span = float(max(ext[1] - ext[0], ext[3] - ext[2], 1.0))
+
+            if self.cb_curl.isChecked():
+                curl = np.asarray(self._z[f"if{k}_curl"], float)
+                gn = curl.shape[0]
+                sx = (ext[1] - ext[0]) / max(gn - 1, 1)
+                sy = (ext[3] - ext[2]) / max(gn - 1, 1)
+                self._layers.append(self.viewer.add_image(
+                    curl, name=f"{m['name']} |curl|", colormap="turbo",
+                    blending="additive", opacity=0.6,
+                    scale=(sy, sx), translate=(ext[2], ext[0]),
+                    contrast_limits=(0.0, max(0.45, float(curl.max()))),
+                ))
+
+            if self.cb_match.isChecked():
+                mr = np.asarray(self._z[f"if{k}_match_ref"], float)
+                mv = np.asarray(self._z[f"if{k}_match_mov"], float)
+                if len(mr):
+                    lines = [np.array([[r[1], r[0]], [v[1], v[0]]])
+                             for r, v in zip(mr, mv)]  # (y, x)
+                    resid = np.linalg.norm(mr - mv, axis=1)
+                    norm = np.clip(resid / (np.percentile(resid, 95) + 1e-9), 0, 1)
+                    colors = np.stack(
+                        [norm, 1.0 - norm, np.zeros_like(norm), np.ones_like(norm)],
+                        axis=1,
+                    )  # green (tight) -> red (large residual)
+                    self._layers.append(self.viewer.add_shapes(
+                        lines, shape_type="line", edge_color=colors,
+                        edge_width=span / 400.0, name=f"{m['name']} matches",
+                    ))
+
+            if self.cb_quiver.isChecked():
+                vp = np.asarray(self._z[f"if{k}_vec_pts"], float)
+                vd = np.asarray(self._z[f"if{k}_vec_dir"], float)
+                if len(vp):
+                    s = float(self.vec_scale.value())
+                    vecs = np.zeros((len(vp), 2, 2))
+                    vecs[:, 0, 0], vecs[:, 0, 1] = vp[:, 1], vp[:, 0]       # origin (y,x)
+                    vecs[:, 1, 0], vecs[:, 1, 1] = vd[:, 1] * s, vd[:, 0] * s  # dir (y,x)
+                    self._layers.append(self.viewer.add_vectors(
+                        vecs, name=f"{m['name']} warp×{s:g}",
+                        edge_color="cyan", edge_width=span / 700.0,
+                    ))
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(
+                self, "Render failed", f"{exc}\n\n{traceback.format_exc()}"
+            )
+            return
+
+        self.stats.setPlainText(
+            f"{m['name']}\n"
+            f"warp_accepted={m['warp_accepted']}  qc_accepted={m['qc_accepted']}  "
+            f"chainable={m['chainable']}\n"
+            f"max|curl|={m['max_curl']:.3f}  min detJ={m['min_detj']:.3f}  "
+            f"match={m['match_fraction']:.2f}  n_matches={m['n_matches']}\n"
+            + (f"reasons: {m['reasons']}" if m["reasons"] else "")
+        )
+
+    # ---- misc ------------------------------------------------------------ #
+    def _clear(self) -> None:
+        for ly in self._layers:
+            try:
+                self.viewer.layers.remove(ly)
+            except Exception:  # noqa: BLE001
+                pass
+        self._layers = []
+
+    def _warn(self, msg: str) -> None:
+        QMessageBox.warning(self, "Warp/Match Inspector", msg)

@@ -66,6 +66,18 @@ _MIN_CELLS = 12     # and at least this many correspondences, for a stable fit
 _AFFINE_HALF = 20      # small match window: minimises within-window-deformation aniso bias
 _ANISO_GATE = 0.02     # commit aniso/shear only if max(sx,sy)/min(sx,sy)-1 exceeds this
 
+# Physical guard on the committed residual-affine. _ANISO_GATE bounds the anisotropy
+# RATIO but NOT the absolute AREA, so the affine RANSAC can overfit a both-axes stretch
+# two adjacent EM sections cannot physically show (Monopoles sec12->sec13: det 1.12, an
+# 8.9%/3.1% stretch) — left in, it warps the volume corner by thousands of Å. We clamp
+# A_res's singular values and determinant into a physical band (keeping its orientation),
+# so a gross stretch is reined to a physical one. The band's low end must clear the
+# largest *real* compression in the stack (Monopoles sec10->sec11 sv 0.917, det 0.937 —
+# a genuine aniso that HELPS the MTs), so it only bites the overfit outlier. The MT
+# scale-gate (gate_coarse_scale) does the precise per-interface validation on top.
+_AFFINE_SV_BAND = (0.85, 1.15)    # per-axis stretch magnitude rail (gross single-axis)
+_AFFINE_DET_BAND = (0.90, 1.10)   # area change |det(A_res)| (the both-axes inflation)
+
 # Rotation = the angle with the most weighted RANSAC inlier SUPPORT (not a central-disk
 # NCC peak), which resolves the 180° branch by image consensus: a wrong flip leaves few
 # rigidly consistent cells so its support collapses.
@@ -286,6 +298,26 @@ def _ransac_affine(
     return A, t, best_inl, float(conf[best_inl].sum())
 
 
+def _clamp_affine(A: np.ndarray):
+    """Bound a residual-affine into a physical stretch/area band, keeping orientation.
+
+    SVD ``A = U·diag(s)·Vt``; clamp each singular value into :data:`_AFFINE_SV_BAND`
+    (per-axis stretch rail), then clamp ``det`` into :data:`_AFFINE_DET_BAND` by an
+    isotropic rescale — which leaves the anisotropy *direction and ratio* intact while
+    reining the absolute AREA the ratio-only :data:`_ANISO_GATE` never bounded. So a
+    genuine mild aniso passes through unchanged and only a gross over-stretch is pulled
+    back to the physical edge. :return: ``(A_clamped, changed)``.
+    """
+    U, s, Vt = np.linalg.svd(A)
+    s_c = np.clip(s, _AFFINE_SV_BAND[0], _AFFINE_SV_BAND[1])
+    A_c = (U * s_c) @ Vt
+    det = float(np.linalg.det(A_c))
+    lo, hi = _AFFINE_DET_BAND
+    if det > 0 and (det < lo or det > hi):
+        A_c = A_c * float(np.sqrt(np.clip(det, lo, hi) / det))
+    return A_c, not np.allclose(A_c, A, atol=1e-6)
+
+
 def _affine_refine(fixed, moving, ang, center, *, metric, grid, search, workers,
                    half=_AFFINE_HALF):
     """Recover a per-interface anisotropic/shear linear part once the angle is locked.
@@ -316,6 +348,7 @@ def _affine_refine(fixed, moving, ang, center, *, metric, grid, search, workers,
     A, t, inl, _support = _ransac_affine(src, dst, conf, tol=tol)
     if int(inl.sum()) < _MIN_CELLS:
         return None
+    A, _ = _clamp_affine(A)  # physical guard: rein a non-physical over-stretch / area
     a = np.deg2rad(ang)
     R = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
     center = np.asarray(center, float)

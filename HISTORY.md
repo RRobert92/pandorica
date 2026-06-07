@@ -5,6 +5,73 @@ All notable changes to pandorica are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] — 2026-06-07
+
+### Fixed
+
+- **Microtubules now chain across an interface whose fine warp is rejected, as long
+  as the matches themselves are trustworthy.** Chaining was gated on the full
+  per-interface QC, which folds in the warp's diffeomorphism certificate. But that
+  certificate answers whether the fine warp is safe to apply to the *volume pixels* —
+  a different question from whether the *correspondences* are good enough to connect
+  microtubules. On a genuinely harder serial-section join (low overlap, shallow MTs,
+  a real non-rigid shear), the matches can be perfectly coherent (74 % matched, shift
+  incoherence well inside the gate) while the residual warp carries a *distributed*
+  twist whose vorticity exceeds the bound — so the warp is rejected, the interface is
+  rejected, `chain_filaments` skips it wholesale, and *every* microtubule across that
+  joint is dropped. The section showed zero connections despite healthy matches.
+  A new `InterfaceQC.chainable` flag now carries the match-quality verdict (match
+  fraction + shift coherence) independently of the warp certificate; chaining keys off
+  `chainable` while the certificate still gates the pixel warp (the volume already
+  falls back to the rigid coarse where a warp is rejected). The existing orient→split
+  pass still cuts any individual joints whose two halves do not continue, so a
+  coherent-but-bent interface connects the microtubules it can and drops only the few
+  that genuinely do not line up. On a dense stack the worst interface went from **0 to
+  759** connected cross-section filaments (70 of 829 chained pairs cut by the geometric
+  split), with every healthy interface byte-identical. The per-interface report now
+  shows a `chained=` column and flags "warp flagged but MTs chained" so a rejected warp
+  that still connects is explicit. Note: an interface cleaned this way still has the
+  genuine deformation it could not warp away — a *quality* concern (the volume falls
+  back to coarse there), no longer a *connectivity* one.
+
+### Added
+
+- **A napari "Warp / Match Inspector" widget, fed by a new `--save-inspect` CLI flag.**
+  Diagnosing why one interface mis-aligns previously meant re-running the whole stitch.
+  `pandorica stitch --save-inspect` now writes a compact `stitch_inspect.npz` alongside
+  the outputs: for every interface it stores the matched endpoint pairs, the warp
+  displacement field sampled on a grid, its `|curl|`, and the QC verdict — all in the
+  graph-output frame (via the same framed-warp transform the export uses, so the bundle
+  overlays the written spatial graph). The new dock widget loads that bundle and, per
+  interface, overlays the match residual lines (coloured green→red by residual length),
+  the warp displacement quiver, and the `|curl|` heatmap, so you can see exactly which
+  matches or warp regions misbehave — and inspect a 15-minute stitch in seconds without
+  recomputing it.
+
+## [1.2.2] — 2026-06-06
+
+### Fixed
+
+- **An overfit image-coarse scale no longer warps a section's volume corner.** The
+  image coarse fits a per-interface anisotropic stretch, and a mild one is correct —
+  it is the knife/beam compression, and applying it makes the microtubules match
+  *better*. But the affine refine only gated the stretch's *anisotropy ratio*, never
+  its absolute *area*, so on an occasional interface it committed a non-physical
+  both-axes inflation (a real case: a 12 %-area stretch two adjacent serial sections
+  cannot show). That stretch leaves the section centre roughly right but throws the
+  far corner by thousands of Å — the "top corner doesn't line up" artifact — and the
+  guarded residual warp cannot undo a global area change. Two complementary guards now
+  catch it: (1) `image_only_poses` clamps each committed residual-affine's singular
+  values and determinant into a physical band (keeping its orientation), reining a
+  gross overfit even with no microtubules to consult; and (2) a microtubule
+  **scale-gate** (`gate_coarse_scale`) validates every non-trivial-scale interface
+  against the dense MTs — if rotation-only matches clearly better than the full image
+  pose, the scale is dropped to rotation-only and the pose chain re-accumulated. The
+  gate is the scale analogue of the existing rotation rescue and fires only where a
+  scale genuinely hurts: on a real dense stack it corrected exactly the one outlier
+  interface (matched fraction 49 % → 76 %, the corner stretch from ~5200 Å to 0)
+  while leaving every interface whose anisotropy *helps* the microtubules untouched.
+
 ## [1.2.1] — 2026-06-06
 
 ### Changed

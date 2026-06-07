@@ -160,6 +160,7 @@ def run_stitch(
     workers: Optional[int] = None,
     allow_scale: bool = False,
     lambda_scale: float = 1.0,
+    save_inspect: bool = False,
     log=print,
 ) -> dict:
     """
@@ -204,6 +205,10 @@ def run_stitch(
         (only active with ``allow_scale=True``). Higher = pulled harder
         toward 1; default ``1.0`` is a mild bias that suppresses greedy's
         multiplicative scale drift while still letting the solve adapt.
+    :param save_inspect: also write ``stitch_inspect.npz`` — a per-interface
+        bundle of MT matches + warp field + ``|curl|`` + QC, for the napari
+        ``WarpMatchInspectorWidget`` to overlay (inspect which matches / warp
+        regions misbehave without re-running the stitch). Default ``False``.
     :param log: line logger (default ``print``); receives each report line.
     :return: dict with output paths and a timing/settings report.
     """
@@ -233,6 +238,7 @@ def run_stitch(
         f"trim_to_mts    : {trim_to_mts}",
         f"mt_pad_frac    : {mt_pad_frac}",
         f"workers        : {workers}",
+        f"save_inspect   : {save_inspect}",
         "",
     ]
     for line in report:
@@ -348,7 +354,11 @@ def run_stitch(
         poses = stitch.result_poses(result)
         mt_warps = stitch.result_warps(result)
         chain_pairs = [iface.id_pairs for iface in result.base.interfaces]
-        chain_accepted = [bool(iface.qc.accepted) for iface in result.base.interfaces]
+        # Chain on match trustworthiness, NOT the full QC: an interface whose warp is
+        # too twisty to apply to pixels (rejected) but whose MT matches are coherent
+        # is still safe to CONNECT. The volume already falls back to coarse for the
+        # rejected warp, and the downstream orient/split cuts any bad individual joints.
+        chain_accepted = [bool(iface.qc.chainable) for iface in result.base.interfaces]
         _say(
             "--- Per-interface (coarse / rel / match / warp / QC / coarse-flag / intensity) ---"
         )
@@ -360,8 +370,11 @@ def run_stitch(
                 f"  {row['interface']:>16}: coarse={row['coarse_deg']:+7.1f}°  "
                 f"rel={row['relative_deg']:+7.2f}°  match={row['match_frac'] * 100:4.0f}%"
                 f"  warp_ok={row['warp_ok']!s:5}  qc_ok={row['qc_ok']!s:5}"
+                f"  chained={row['chained']!s:5}"
                 f"  coarse_flag={row['hybrid_flag']!s:5}  intensity={iv_s:4}"
                 + (f"  [{row['reasons']}]" if row["reasons"] else "")
+                + ("  [warp flagged but MTs chained]"
+                   if row["chained"] and not row["qc_ok"] else "")
             )
         _say(f"  overall accepted: {result.accepted}")
         # Decompose the accept gate so a False is explained, not just reported.
@@ -401,11 +414,27 @@ def run_stitch(
                 f"--- MT rotation rescue: {len(result.rescues)} interface(s) where "
                 "the image coarse rotation failed (the dense MTs re-estimated it) ---"
             )
-            for (k, img_a, mt_a, img_m, mt_m) in result.rescues:
+            for (k, img_a, mt_a, img_m, mt_m, aniso) in result.rescues:
+                aniso_s = (f"  aniso=({aniso[0]:.3f},{aniso[1]:.3f})"
+                           if aniso is not None else "")
                 _say(
                     f"  {ds.interface_label(k):>16}: image {img_a:+.1f}° "
                     f"(match {img_m * 100:.0f}%)  ->  MT {mt_a:+.1f}° "
-                    f"(match {mt_m * 100:.0f}%)"
+                    f"(match {mt_m * 100:.0f}%){aniso_s}"
+                )
+
+        if getattr(result, "scale_gates", None):
+            _say("")
+            _say(
+                f"--- MT scale-gate: {len(result.scale_gates)} interface(s) where the "
+                "image-coarse scale was dropped (the dense MTs matched better "
+                "rotation-only — an overfit stretch that warps the volume corner) ---"
+            )
+            for (k, det, m_full, m_rot) in result.scale_gates:
+                _say(
+                    f"  {ds.interface_label(k):>16}: image scale det={det:.3f} "
+                    f"(match {m_full * 100:.0f}%)  ->  rotation-only "
+                    f"(match {m_rot * 100:.0f}%)"
                 )
     else:
         from pandorica.stitch.image_pose import image_only_poses
@@ -523,6 +552,13 @@ def run_stitch(
             progress=lambda m, fr: log(f"  export: {m} ({fr * 100:.0f}%)"),
         )
     t_export = time.perf_counter() - t
+
+    if save_inspect and use_mt:
+        from pandorica.stitch.inspect import write_inspection_bundle
+        written["inspect"] = write_inspection_bundle(
+            result, ds.coords_list(), poses,
+            [s.name for s in ds.sections], join(out, "stitch_inspect.npz"),
+        )
 
     total = time.perf_counter() - t0
     _say("")

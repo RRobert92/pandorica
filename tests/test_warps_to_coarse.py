@@ -36,6 +36,8 @@ from pandorica.stitch.transform.solver import (
     invert_pose,
     compose_poses,
     make_pose,
+    pose_from_matrix,
+    linear_part,
 )
 
 _STEP = {"Angle": 0.5, "Tx": 6.0, "Ty": -3.0, "Scale": 1.0}
@@ -229,6 +231,90 @@ def test_stitch_sections_runs_rescue_path_clean():
     res = stitch_sections(coords, coarse_poses=gt)
     assert isinstance(res.rescues, list) and res.rescues == []
     _poses_match(res.poses, gt)
+
+
+# --------------------------------------------------------------------------- #
+# scale-gate: drop an overfit image scale the MTs reject (rotation-only matches better)
+# --------------------------------------------------------------------------- #
+def test_scale_gate_drops_an_overfit_image_scale():
+    # The MTs correspond under a RIGID gt (rotation + shift). The image coarse pose for
+    # section 1 carries an extra anisotropic over-stretch (det ~1.12) the MTs reject:
+    # rotation-only then matches better, so the gate must drop the scale and re-accumulate
+    # the chain back to ~rotation-only. This is the sec12->sec13 failure in miniature.
+    gt = _coarse_chain(2)
+    coords = _stack(gt, m=45, seed=5, spread=(60.0, 60.0))
+    # An anisotropic scale about a center FAR from the cloud (as on real data, where the
+    # section centre is tens of thousands of Å from the origin): it both stretches AND
+    # mis-maps the whole cloud, collapsing the match — exactly what the MTs reject.
+    R1, t1 = linear_part(gt[1]), np.array([gt[1]["Tx"], gt[1]["Ty"]])
+    S, c0 = np.diag([1.16, 0.97]), np.array([5000.0, 0.0])  # det(S) ~1.125
+    bad = pose_from_matrix(R1 @ S, R1 @ ((np.eye(2) - S) @ c0) + t1)
+
+    new_poses, gated = core.gate_coarse_scale(coords, [dict(gt[0]), bad])
+
+    assert len(gated) == 1 and gated[0][0] == 0
+    assert gated[0][3] > gated[0][2]                       # rot-only beat the full scale
+    rel = compose_poses(invert_pose(new_poses[0]), new_poses[1])
+    sv = np.linalg.svd(linear_part(rel), compute_uv=False)
+    assert max(abs(sv[0] - 1.0), abs(sv[1] - 1.0)) < 0.05  # scale dropped
+
+
+def test_scale_gate_keeps_a_genuine_aniso():
+    # The MTs correspond under a genuine ANISO gt, so the full pose (with that scale)
+    # matches best — the gate must NOT drop it (the knife-compression case that HELPS).
+    L = np.diag([1.12, 0.96]) @ linear_part(make_pose(0.6))
+    gt = [dict(IDENTITY), pose_from_matrix(L, np.array([6.0, -3.0]))]
+    coords = _stack(gt, m=45, seed=6, spread=(60.0, 60.0))
+
+    new_poses, gated = core.gate_coarse_scale(coords, gt)
+
+    assert gated == []                                     # genuine aniso kept
+    _poses_match(new_poses, gt)                            # poses untouched
+
+
+def test_fit_affine_2d_recovers_known_affine():
+    rng = np.random.default_rng(0)
+    src = rng.uniform(-50, 50, size=(30, 2))
+    L_true = np.array([[1.10, 0.05], [-0.03, 0.90]])
+    t_true = np.array([3.0, -2.0])
+    L, t = core._fit_affine_2d(src, src @ L_true.T + t_true)
+    assert np.allclose(L, L_true, atol=1e-6)
+    assert np.allclose(t, t_true, atol=1e-6)
+
+
+def test_rescue_recovers_anisotropy_when_image_failed():
+    # Image coarse failed (section 1 spun 90° wrong) AND the dense MTs correspond under a
+    # genuine ANISOTROPIC gt. The rescue must recover BOTH the rotation and the anisotropy,
+    # so the gap a rigid-only rescue would leave is closed in the COARSE pose.
+    L = np.diag([1.12, 0.96]) @ linear_part(make_pose(0.6))
+    gt = [dict(IDENTITY), pose_from_matrix(L, np.array([6.0, -3.0]))]
+    coords = _stack(gt, m=45, seed=6, spread=(60.0, 60.0))
+    bad = [dict(gt[0]), compose_poses(gt[1], make_pose(90.0))]
+
+    fixed, rescues = core.rescue_coarse_poses(
+        coords, bad, [0.0], match_gate=0.3, search_kwargs={"use_cpd": True},
+    )
+    assert len(rescues) == 1
+    aniso = rescues[0][5]
+    assert aniso is not None                          # anisotropy was recovered
+    assert aniso[0] / aniso[1] > 1.08                 # ~the planted 1.12/0.96 = 1.17
+    sv = np.linalg.svd(
+        linear_part(compose_poses(invert_pose(fixed[0]), fixed[1])), compute_uv=False
+    )
+    assert sv[0] / sv[1] > 1.08                        # the corrected pose carries the aniso
+
+
+def test_rescue_recovers_no_anisotropy_when_isotropic():
+    # Isotropic gt: the rescue fixes the rotation but must NOT invent anisotropy (gate safety).
+    gt = _coarse_chain(2)
+    coords = _stack(gt, m=40, seed=7)
+    bad = [dict(gt[0]), compose_poses(gt[1], make_pose(90.0))]
+
+    fixed, rescues = core.rescue_coarse_poses(
+        coords, bad, [0.0], match_gate=0.3, search_kwargs={"use_cpd": True},
+    )
+    assert len(rescues) == 1
+    assert rescues[0][5] is None                       # no spurious anisotropy
 
 
 def test_evaluate_seed_fit_false_keeps_seed_as_rel():

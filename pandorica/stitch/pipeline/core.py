@@ -63,6 +63,8 @@ from pandorica.stitch.transform.solver import (
     compose_poses,
     global_pose_refine,
     make_pose,
+    linear_part,
+    pose_from_matrix,
 )
 from pandorica.stitch.matching.mt_transform import (
     fit_rigid_transform_2d,
@@ -220,7 +222,7 @@ def _failed_interface(reason: str) -> InterfaceResult:
     from pandorica.stitch.transform.diagnostics import FieldCertificate
 
     cert = FieldCertificate(0.0, np.inf, 0.0, 0.05, 1.0, passed=False)
-    qc = InterfaceQC(False, False, 0.0, np.inf, 0.0, reasons=[reason])
+    qc = InterfaceQC(False, False, False, 0.0, np.inf, 0.0, reasons=[reason])
     return InterfaceResult(
         dict(IDENTITY), dict(IDENTITY), GuardedWarp(cert, 0.0, False, None), qc, {}, []
     )
@@ -238,7 +240,7 @@ def _warpless_interface(rel: Pose) -> InterfaceResult:
     from pandorica.stitch.transform.diagnostics import FieldCertificate
 
     cert = FieldCertificate(1.0, 0.0, 0.0, 0.05, 1.0, passed=False)
-    qc = InterfaceQC(True, False, 0.0, 0.0, 0.0,
+    qc = InterfaceQC(True, False, False, 0.0, 0.0, 0.0,
                      reasons=["image-coarse only (no MT match)"])
     return InterfaceResult(
         dict(rel), dict(rel), GuardedWarp(cert, 0.0, False, None), qc, {}, []
@@ -598,10 +600,30 @@ def register_warps_to_coarse(
     )
 
 
+# Anisotropy recovery in the MT rescue. When the image coarse FAILED on an interface (so it
+# never fit that interface's per-axis stretch — unlike every interface where the image
+# committed aniso=(sx,sy)), the dense MTs are the only remaining source. If the MTs show a
+# residual stretch above this gate, recover an anisotropic affine from the correspondences and
+# adopt it (the symmetric inverse of gate_coarse_scale, which DROPS a bad image scale). Gated
+# high so a healthy residual never trips it: where the image already applied its aniso the
+# residual is ~unit (ratio ~1.01 on Monopoles); only a genuine missed stretch (rescued
+# sec01->sec02, ratio ~1.10, closes ~72% of the boundary gap) clears it.
+_RESCUE_ANISO_GATE = 0.05
+_RESCUE_ANISO_MIN_PAIRS = 12
+
+
+def _fit_affine_2d(src: np.ndarray, dst: np.ndarray):
+    """Least-squares anisotropic affine ``(L, t)`` mapping ``src -> dst`` (``dst ≈ L@src + t``)."""
+    m = np.column_stack([src, np.ones(len(src))])
+    a, *_ = np.linalg.lstsq(m, dst, rcond=None)        # (3, 2): dst ≈ m @ a
+    return a[:2].T, a[2]
+
+
 def _rescue_relative(coords_ref, coords_mov, z_band_fraction, search_kwargs,
                      match_kwargs):
     """Re-estimate one interface's relative pose from the MTs (rotation search +
-    rigid fit), to rescue an interface where the image coarse rotation failed.
+    rigid fit, then optional anisotropy recovery), to rescue an interface where the
+    image coarse rotation failed.
 
     Adoption is decided by the DIRECT criterion — does the re-estimated rotation make
     the MTs actually match (its post-fit match fraction, the caller's gate) — not by
@@ -626,7 +648,36 @@ def _rescue_relative(coords_ref, coords_mov, z_band_fraction, search_kwargs,
     best = _evaluate_seed(seed, ref_eps, mov_eps, rho, False, match_kwargs, fit=True)
     if best is None:
         return None
-    return best["rel"], float(best["match_fraction"]), float(est.angle)
+    rel, mf, aniso = best["rel"], float(best["match_fraction"]), None
+    # Recover this interface's anisotropy from the MTs (the image coarse failed, so it never
+    # could). The stretch lives in the PERIPHERAL MTs, which only match once the warp bootstrap
+    # pulls them in — the single-pass rescue match is the central, near-aligned subset and
+    # under-reads the aniso (sec01->sec02: 1.02 single-pass vs 1.10 dense). So fit the affine on
+    # the DENSE register_warps_to_coarse correspondences, and adopt it only when the stretch is
+    # genuine (> gate) AND it does not hurt the (bootstrapped) match — a spurious affine
+    # overfitting the spatially-varying field would not hold its match when re-applied.
+    rr = register_warps_to_coarse(
+        [coords_ref, coords_mov], [dict(IDENTITY), dict(rel)],
+        z_band_fraction=z_band_fraction, **match_kwargs,
+    )
+    pairs = rr.interfaces[0].id_pairs if rr.interfaces else []
+    if len(pairs) >= _RESCUE_ANISO_MIN_PAIRS:
+        ref_by = {int(e["id"]): np.asarray(e["pos"][:2], float) for e in ref_eps}
+        mov_by = {int(e["id"]): np.asarray(e["pos"][:2], float) for e in mov_eps}
+        pr = [ref_by[int(ri)] for ri, mi, _ in pairs if int(ri) in ref_by and int(mi) in mov_by]
+        pm = [mov_by[int(mi)] for ri, mi, _ in pairs if int(ri) in ref_by and int(mi) in mov_by]
+        if len(pr) >= _RESCUE_ANISO_MIN_PAIRS:
+            lin, t = _fit_affine_2d(np.array(pm), np.array(pr))   # mov-local -> ref-local
+            sv = np.linalg.svd(lin, compute_uv=False)
+            m_cur = float(rr.interfaces[0].confidence.get("match_fraction", mf))
+            if sv[1] > 1e-9 and sv[0] / sv[1] - 1.0 > _RESCUE_ANISO_GATE:
+                rel_aff = pose_from_matrix(lin, t)
+                m_aff = _seed_match_fraction(
+                    coords_ref, coords_mov, rel_aff, z_band_fraction, match_kwargs
+                )
+                if m_aff >= m_cur:
+                    rel, mf, aniso = rel_aff, m_aff, (float(sv[0]), float(sv[1]))
+    return rel, mf, float(est.angle), aniso
 
 
 def rescue_coarse_poses(
@@ -657,7 +708,8 @@ def rescue_coarse_poses(
         ``{"use_cpd": True, ...}`` for the decoy-robust multi-seed search).
     :return: ``(poses, rescues)`` — the corrected absolute pose chain (unchanged
         where nothing was rescued) and a list of
-        ``(k, image_angle, mt_angle, image_match, mt_match)`` for logging.
+        ``(k, image_angle, mt_angle, image_match, mt_match, aniso)`` for logging,
+        where ``aniso`` is the recovered ``(sx, sy)`` or ``None``.
     """
     n = len(coords_list)
     if n < 2:
@@ -676,14 +728,114 @@ def rescue_coarse_poses(
         )
         if out is None:
             continue
-        rel_mt, mf_mt, ang_mt = out
+        rel_mt, mf_mt, ang_mt, aniso_mt = out
         if mf_mt >= match_gate and mf_mt > match_fractions[k]:
             img_ang = float(rels[k].get("Angle", 0.0))
             rels[k] = rel_mt
-            rescues.append((k, img_ang, ang_mt, float(match_fractions[k]), mf_mt))
+            rescues.append(
+                (k, img_ang, ang_mt, float(match_fractions[k]), mf_mt, aniso_mt)
+            )
     if not rescues:
         return [dict(p) for p in coarse_poses], []
     new_poses = [dict(coarse_poses[0])]
     for k in range(n - 1):
         new_poses.append(compose_poses(new_poses[-1], rels[k]))
     return new_poses, rescues
+
+
+# Below this singular-value deviation from 1 a relative pose carries no meaningful scale,
+# so the scale-gate skips it (the ~unit-scale majority of interfaces costs nothing). The
+# floor clears the real per-axis stretch of the *helpful* aniso interfaces on Monopoles
+# (max dev ~0.083) so those still get scored — and kept, because the full pose wins.
+_SCALE_GATE_MIN_SV_DEV = 0.05
+# Rotation-only must beat the full image scale by at least this MT-match margin to drop
+# the scale — well clear of match noise, so a genuinely helpful aniso is never dropped.
+_SCALE_GATE_MARGIN = 0.10
+
+
+def _seed_match_fraction(coords_ref, coords_mov, seed, z_band_fraction, match_kwargs):
+    """Production MT match fraction of one interface under a relative ``seed`` pose.
+
+    Scores through the SAME path the export uses —
+    :func:`register_warps_to_coarse` on the two sections, i.e. the warp **bootstrap** —
+    not a single match. This matters: a single match badly under-reads rotation-only (it
+    keeps the scale-fit translation and never recovers the residual), so a single-pass
+    comparison would wrongly favour the overfit scale; the bootstrap recovers the residual
+    and reveals rotation-only's true quality. ``0.0`` when the interface yields no warp.
+    """
+    r = register_warps_to_coarse(
+        [coords_ref, coords_mov], [dict(IDENTITY), dict(seed)],
+        z_band_fraction=z_band_fraction, **match_kwargs,
+    )
+    if not r.interfaces:
+        return 0.0
+    return float(r.interfaces[0].confidence.get("match_fraction", 0.0))
+
+
+def gate_coarse_scale(
+    coords_list,
+    coarse_poses,
+    *,
+    z_band_fraction: float = 0.15,
+    match_gate: float = 0.3,
+    scale_margin: float = _SCALE_GATE_MARGIN,
+    min_sv_dev: float = _SCALE_GATE_MIN_SV_DEV,
+    **match_kwargs,
+):
+    """Drop an interface's image-coarse scale where the dense MTs match clearly better
+    WITHOUT it.
+
+    The image coarse is reliable almost everywhere, but on an occasional interface the
+    affine refine overfits an extreme anisotropic stretch (a registration artifact — e.g.
+    a 12% area inflation two adjacent EM sections cannot physically show) that warps the
+    volume corner by thousands of Å. The MTs are the detector: *a wrong scale collapses
+    the match while rotation-only recovers it*. For each interface whose relative pose
+    carries a non-trivial scale (singular-value deviation > ``min_sv_dev``), this scores
+    the MT match under the full image pose vs rotation-only; when rotation-only clears
+    ``match_gate`` AND beats the full pose by ``scale_margin`` it drops the scale to
+    rotation-only (translation kept) and re-accumulates the absolute chain. A genuine
+    aniso — which makes the FULL pose match better — is left untouched, so the gate can
+    never make an interface worse. This is the SCALE analogue of
+    :func:`rescue_coarse_poses` (which rescues a wrong rotation); the two target disjoint
+    interfaces (rescue: match below gate; gate: rotation-only beats a committed scale).
+
+    :return: ``(poses, gated)`` — the corrected absolute pose chain (unchanged where
+        nothing was gated) and a list of ``(k, det_before, full_match, rot_match)`` for
+        logging.
+    """
+    n = len(coords_list)
+    if n < 2:
+        return [dict(p) for p in coarse_poses], []
+    rels = [
+        compose_poses(invert_pose(coarse_poses[k]), coarse_poses[k + 1])
+        for k in range(n - 1)
+    ]
+    gated = []
+    for k in range(n - 1):
+        rel = rels[k]
+        sv = np.linalg.svd(linear_part(rel), compute_uv=False)
+        if max(abs(sv[0] - 1.0), abs(sv[1] - 1.0)) <= min_sv_dev:
+            continue  # ~unit scale: nothing to gate
+        # Rotation-only seed = rotate the moving cloud IN PLACE about its centroid (the
+        # rescue's seed). Keeping the scale-fit translation instead misplaces the section
+        # (that translation was fit FOR the bad scale); rotating in place lets the
+        # register recover the true translation, the same way the export will.
+        mov_eps = _face(coords_list[k + 1], "bottom", z_band_fraction)
+        if len(mov_eps) < 3:
+            continue
+        rot_rel = _centroid_rotation_seed(float(rel["Angle"]), mov_eps)
+        m_full = _seed_match_fraction(
+            coords_list[k], coords_list[k + 1], rel, z_band_fraction, match_kwargs
+        )
+        m_rot = _seed_match_fraction(
+            coords_list[k], coords_list[k + 1], rot_rel, z_band_fraction, match_kwargs
+        )
+        if m_rot >= match_gate and m_rot > m_full + scale_margin:
+            gated.append((k, float(np.linalg.det(linear_part(rel))), m_full, m_rot))
+            rels[k] = rot_rel
+    if not gated:
+        return [dict(p) for p in coarse_poses], []
+    new_poses = [dict(coarse_poses[0])]
+    for k in range(n - 1):
+        new_poses.append(compose_poses(new_poses[-1], rels[k]))
+    return new_poses, gated

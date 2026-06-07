@@ -90,3 +90,35 @@ def test_incoherence_threshold_passes_real_nonrigid():
     conf = {"match_fraction": 0.7, "shift_incoherence_rho": 1.3}
     r = qc.assess_interface(_cert(True), conf, *_ALIGNED)
     assert r.accepted
+
+
+# --------------------------------------------------------------------------- #
+# chainable: MT chaining is decoupled from the warp certificate
+# --------------------------------------------------------------------------- #
+def test_warp_failed_but_matches_good_is_chainable():
+    # The sec01->sec02 case: the fine warp is too twisty to apply to pixels (rejected),
+    # but the MT matches are coherent. The interface is NOT accepted (warp reason) yet
+    # IS chainable — so the good correspondences still connect, while the pixel warp
+    # stays gated and the volume falls back to coarse.
+    r = qc.assess_interface(_cert(False), {"match_fraction": 0.74,
+                                           "shift_incoherence_rho": 1.86}, *_ALIGNED)
+    assert not r.accepted                      # warp failed -> overall reject
+    assert any("diffeomorphism" in s for s in r.reasons)
+    assert r.chainable                         # ...but the MTs still connect
+
+
+def test_clean_interface_is_chainable():
+    r = qc.assess_interface(_cert(True), _good_conf(), *_ALIGNED)
+    assert r.accepted and r.chainable
+
+
+def test_low_match_is_not_chainable():
+    # Untrustworthy matches must NOT chain, warp pass or not.
+    conf = {"match_fraction": 0.1, "shift_incoherence_rho": 0.1}
+    assert not qc.assess_interface(_cert(True), conf, *_ALIGNED).chainable
+    assert not qc.assess_interface(_cert(False), conf, *_ALIGNED).chainable
+
+
+def test_incoherent_shifts_are_not_chainable():
+    conf = {"match_fraction": 0.9, "shift_incoherence_rho": 5.0}
+    assert not qc.assess_interface(_cert(True), conf, *_ALIGNED).chainable
