@@ -141,6 +141,60 @@ def test_outlier_match_is_rejected():
     assert np.std(shifts, axis=0).max() < 1.0
 
 
+# --------------------------------------------------------------------------- #
+# orientation (sign) gate: reject fold-back (anti-parallel) matches
+# --------------------------------------------------------------------------- #
+def test_sign_gate_rejects_fold_back():
+    # Anti-parallel in-plane tangents = a fold-back (two different MTs). The
+    # |cos| angle gate accepts it (reads as aligned); the orientation gate rejects.
+    rho = 1.0
+    ref = [_ep(0, (0, 0, 0), (1, 0, 0))]
+    mov = [_ep(0, (1, 0, 0), (-1, 0, 0))]      # within distance, anti-parallel
+    matches, *_ = mt.match_sections(ref, mov, rho)
+    assert matches == []                       # rejected by the orientation gate
+    # Disabling the orientation gate (very negative threshold) lets it match again,
+    # confirming it was the sign gate (not distance/angle) that dropped it.
+    matches2, *_ = mt.match_sections(ref, mov, rho, sign_min_cos=-2.0)
+    assert len(matches2) == 1
+
+
+def test_sign_gate_exempts_near_vertical():
+    # Near-vertical stubs have negligible, noisy in-plane tangents, so the sign
+    # gate must NOT judge them — they match on position as before.
+    rho = 1.0
+    ref = [_ep(0, (0, 0, 0), (0.1, 0.0, 0.99))]
+    mov = [_ep(0, (1, 0, 0), (-0.1, 0.0, 0.99))]  # in-plane anti-parallel but |d_xy|<0.2
+    matches, *_ = mt.match_sections(ref, mov, rho)
+    assert len(matches) == 1                   # exempt from the orientation gate
+
+
+# --------------------------------------------------------------------------- #
+# geometry-default uncrosser: resolve parallel rung-swaps
+# --------------------------------------------------------------------------- #
+def test_uncrosser_fixes_parallel_rung_swap():
+    # Two parallel MTs whose Hungarian assignment came out CROSSED. Direction can't
+    # tell crossed from uncrossed (both parallel), so the old direction-only rule
+    # (margin 0) leaves it; the geometry-default rule uncrosses it.
+    ref = [_ep(0, (0, 0, 0), (0, 1, 0)), _ep(1, (20, 0, 0), (0, 1, 0))]
+    mov = [_ep(0, (0, 5, 0), (0, 1, 0)), _ep(1, (20, 5, 0), (0, 1, 0))]
+    crossed = [(0, 1, 0.0), (1, 0, 0.0)]       # A->Q, B->P  (segments cross)
+    rho = 20.0
+    kept = mt.uncross_pairs(crossed, ref, mov, rho, dir_veto_margin=0.0)
+    assert [(r, c) for r, c, _ in kept] == [(0, 1), (1, 0)]   # old rule: unchanged
+    fixed = mt.uncross_pairs(crossed, ref, mov, rho, dir_veto_margin=0.2)
+    assert [(r, c) for r, c, _ in fixed] == [(0, 0), (1, 1)]  # geometry: uncrossed
+
+
+def test_uncrosser_keeps_a_genuine_crossing():
+    # When the tangents CLEARLY prefer the crossed pairing (each stub points at its
+    # crossed partner), the veto wins and the crossing is preserved.
+    ref = [_ep(0, (0, 0, 0), (1, 1, 0)), _ep(1, (20, 0, 0), (-1, 1, 0))]
+    mov = [_ep(0, (0, 5, 0), (-1, 1, 0)), _ep(1, (20, 5, 0), (1, 1, 0))]
+    crossed = [(0, 1, 0.0), (1, 0, 0.0)]       # A->Q, B->P: tangents continue across
+    kept = mt.uncross_pairs(crossed, ref, mov, 20.0, dir_veto_margin=0.2)
+    assert [(r, c) for r, c, _ in kept] == [(0, 1), (1, 0)]   # veto: stays crossed
+
+
 def test_confidence_separates_good_from_incoherent():
     ref = _grid_endpoints()
     rho = 10.0

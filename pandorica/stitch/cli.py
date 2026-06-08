@@ -149,6 +149,8 @@ def run_stitch(
     image_fill: bool = True,
     method: str = "ncc",
     warp_omega: float = 0.3,
+    warp_tangent_weight: float = 0.4,
+    cut_vertical_jog_rho: float = 2.0,
     zblend: bool = True,
     cpd_coarse: bool = True,
     downscale: int = 1,
@@ -160,6 +162,8 @@ def run_stitch(
     workers: Optional[int] = None,
     allow_scale: bool = False,
     lambda_scale: float = 1.0,
+    save_inspect: bool = False,
+    dev: bool = False,
     log=print,
 ) -> dict:
     """
@@ -173,6 +177,15 @@ def run_stitch(
         ``'grad'`` (NCC on edge maps), ``'mi'`` (mutual information; ~2× slower,
         helps only for cross-modality / contrast-mismatched faces).
     :param warp_omega: TPS vorticity bound (lower = smoother / fewer whirlpools).
+    :param warp_tangent_weight: gentle tangent-continuity term in the fine warp (0 = off,
+        ~0.4 = gentle). Nudges matched SHALLOW-MT stubs toward continuing smoothly across the
+        seam (minimises "stairs"), staying subordinate to the vorticity/detJ guard so it never
+        forces a whirlpool nor smooths a wrong (near-vertical) match into a convincing fake.
+    :param cut_vertical_jog_rho: cut a NEAR-VERTICAL matched pair from chaining when its
+        residual lateral jog (after coarse+warp) exceeds this many ρ (``0`` = off). Such pairs
+        have no reliable in-plane direction, so the direction-based chain split can't judge
+        them; a large jog means two different microtubules were joined. Conservative (``2.0``):
+        on a healthy stack no near-vertical pair clears it.
     :param zblend: Z-varying symmetric warp (else one warp per section).
     :param cpd_coarse: CPD multi-seed coarse rotation search (decoy-/±90°-robust).
     :param downscale: integer volume decimation (1 = full resolution).
@@ -204,6 +217,14 @@ def run_stitch(
         (only active with ``allow_scale=True``). Higher = pulled harder
         toward 1; default ``1.0`` is a mild bias that suppresses greedy's
         multiplicative scale drift while still letting the solve adapt.
+    :param save_inspect: also write ``stitch_inspect.npz`` — a per-interface
+        bundle of MT matches + warp field + ``|curl|`` + QC, for the napari
+        ``WarpMatchInspectorWidget`` to overlay (inspect which matches / warp
+        regions misbehave without re-running the stitch). Default ``False``.
+    :param dev: stream the full per-interface internals, the dense QC table, the
+        per-section pose matrices, and the per-stage timing to the terminal (for
+        debugging). Default ``False`` prints a clean, legible summary instead; the
+        full detail is **always** written to ``stitch_log.txt`` either way.
     :param log: line logger (default ``print``); receives each report line.
     :return: dict with output paths and a timing/settings report.
     """
@@ -225,6 +246,8 @@ def run_stitch(
         f"image_fill     : {image_fill}",
         f"method         : {method}",
         f"warp_omega     : {warp_omega}",
+        f"warp_tan_weight: {warp_tangent_weight}",
+        f"cut_vert_jog_ρ : {cut_vertical_jog_rho}",
         f"zblend         : {zblend}",
         f"cpd_coarse     : {cpd_coarse}",
         f"use_gpu        : {use_gpu}   (resolved device: {device})",
@@ -233,6 +256,8 @@ def run_stitch(
         f"trim_to_mts    : {trim_to_mts}",
         f"mt_pad_frac    : {mt_pad_frac}",
         f"workers        : {workers}",
+        f"save_inspect   : {save_inspect}",
+        f"dev            : {dev}",
         "",
     ]
     for line in report:
@@ -241,6 +266,48 @@ def run_stitch(
     def _say(msg):
         report.append(msg)
         log(msg)
+
+    def _dev(msg):
+        # Full detail: always recorded to stitch_log.txt; echoed to the terminal only
+        # under --dev, so the default view stays clean.
+        report.append(msg)
+        if dev:
+            log(msg)
+
+    def _clean(msg):
+        # A legible terminal-only line for the default view (the file keeps the fuller
+        # _dev line instead). Suppressed under --dev, where the full line shows.
+        if not dev:
+            log(msg)
+
+    def _coarse_clean(info):
+        # One readable line per interface in the default view; the full "[image-pose] …"
+        # line is recorded via _dev / the log file.
+        lbl = info["label"].replace("->", " → ")
+        sh = info["shift"]
+        bits = [f"rotate {info['rot']:+.1f}°",
+                f"shift {abs(sh[0]):.0f}×{abs(sh[1]):.0f} px"]
+        if info.get("aniso_committed"):
+            bits.append(f"stretch {info['sx']:.2f}×{info['sy']:.2f}")
+        line = f"  {lbl}   {', '.join(bits)}   ({info['agree']:.0%} agree)"
+        if info.get("flagged") or not info.get("trans_ok", True):
+            line += "   — REVIEW (verify visually)"
+        _clean(line)
+
+    def _joint_status(row):
+        # One readable status line per joint in the default view (replaces the dense
+        # coarse/rel/match/warp/QC table, which goes to _dev / the log file).
+        lbl = row["interface"].replace("->", " → ").strip()
+        m = f"{row['match_frac'] * 100:.0f}% matched"
+        if not row["chained"]:
+            _clean(f"  REVIEW  {lbl}   not connected · {m}"
+                   + (f" · {row['reasons']}" if row["reasons"] else ""))
+        elif row["intensity_ok"] is False:
+            _clean(f"  REVIEW  {lbl}   connected · {m} · rotation needs a visual check")
+        elif not row["warp_ok"]:
+            _clean(f"  {lbl}   connected · {m} · warp too twisty — kept coarse alignment")
+        else:
+            _clean(f"  {lbl}   connected · {m} · warp applied")
 
     # --- load -------------------------------------------------------------- #
     t = time.perf_counter()
@@ -290,41 +357,91 @@ def run_stitch(
     # --- poses: MT-based or image-only ------------------------------------- #
     t = time.perf_counter()
     t_solve = 0.0
-    t_xcheck = 0.0
+    t_coarse = 0.0
     if use_mt:
-        _say("--- Solving MT poses (coarse rotation -> register; live) ---")
 
         def _solve_progress(phase, k, ntot):
-            _say(f"  [{phase}] interface {k + 1}/{ntot}")
+            _dev(f"  [{phase}] interface {k + 1}/{ntot}")
+            verb = "re-aligning" if phase == "rescue-warp" else "aligning"
+            _clean(f"  {verb} {ds.interface_label(k).replace('->', ' → ')}  ({k + 1}/{ntot})")
 
-        _ts = time.perf_counter()
-        result = stitch_sections(
-            coords,
-            warp_omega_max=warp_omega,
-            cpd_coarse=cpd_coarse,
-            allow_scale=allow_scale,
-            lambda_scale=lambda_scale,
-            progress=_solve_progress,
-        )
-        t_solve = time.perf_counter() - _ts
+        if has_vol:
+            # COARSE -> FINE (default): the image fixes the global pose — translation,
+            # rotation, AND anisotropic scale — and that one pose is applied to the
+            # microtubules too; the MTs then only fit the fine residual warp on top of
+            # it (the spatially-varying baking deformation a single global affine
+            # cannot hold). The legacy MT point-cloud coarse + MT pose-solve is kept
+            # only as the no-volume fallback below.
+            from pandorica.stitch.image_pose import image_only_poses
+
+            _say(
+                "--- Coarse poses from image (rotation + shift + anisotropic scale; "
+                "applied to MTs) ---"
+            )
+            _dev(
+                "    NOTE: the inter-section ROTATION is image-derived; the MT match "
+                "fraction below validates it (a wrong rotation collapses the match)."
+            )
+            _tc = time.perf_counter()
+            coarse_poses = image_only_poses(
+                ds, metric=method if method != "mi" else "ncc",
+                workers=workers, log=_dev, on_interface=_coarse_clean,
+            )
+            t_coarse = time.perf_counter() - _tc
+            _say("")
+            _say("--- MT fine residual warp (relative to the image coarse; live) ---")
+            _ts = time.perf_counter()
+            result = stitch_sections(
+                coords,
+                coarse_poses=coarse_poses,
+                warp_omega_max=warp_omega,
+                warp_tangent_weight=warp_tangent_weight,
+                cut_vertical_jog_rho=cut_vertical_jog_rho,
+                progress=_solve_progress,
+            )
+            t_solve = time.perf_counter() - _ts
+        else:
+            _say(
+                "--- No volumes: legacy MT-pose solve (coarse rotation -> register; "
+                "live) ---"
+            )
+            _ts = time.perf_counter()
+            result = stitch_sections(
+                coords,
+                warp_omega_max=warp_omega,
+                warp_tangent_weight=warp_tangent_weight,
+                cut_vertical_jog_rho=cut_vertical_jog_rho,
+                cpd_coarse=cpd_coarse,
+                allow_scale=allow_scale,
+                lambda_scale=lambda_scale,
+                progress=_solve_progress,
+            )
+            t_solve = time.perf_counter() - _ts
+
         poses = stitch.result_poses(result)
         mt_warps = stitch.result_warps(result)
         chain_pairs = [iface.id_pairs for iface in result.base.interfaces]
-        chain_accepted = [bool(iface.qc.accepted) for iface in result.base.interfaces]
-        _say(
-            "--- Per-interface (coarse / rel / match / warp / QC / coarse-flag / intensity) ---"
-        )
+        # Chain on match trustworthiness, NOT the full QC: an interface whose warp is
+        # too twisty to apply to pixels (rejected) but whose MT matches are coherent
+        # is still safe to CONNECT. The volume already falls back to coarse for the
+        # rejected warp, and the downstream orient/split cuts any bad individual joints.
+        chain_accepted = [bool(iface.qc.chainable) for iface in result.base.interfaces]
+        _say("--- Joints ---")
         rows = stitch.interface_rows(result, ds)
         for row in rows:
             iv = row["intensity_ok"]
             iv_s = "n/a" if iv is None else ("ok" if iv else "FAIL")
-            _say(
+            _dev(
                 f"  {row['interface']:>16}: coarse={row['coarse_deg']:+7.1f}°  "
                 f"rel={row['relative_deg']:+7.2f}°  match={row['match_frac'] * 100:4.0f}%"
                 f"  warp_ok={row['warp_ok']!s:5}  qc_ok={row['qc_ok']!s:5}"
+                f"  chained={row['chained']!s:5}"
                 f"  coarse_flag={row['hybrid_flag']!s:5}  intensity={iv_s:4}"
                 + (f"  [{row['reasons']}]" if row["reasons"] else "")
+                + ("  [warp flagged but MTs chained]"
+                   if row["chained"] and not row["qc_ok"] else "")
             )
+            _joint_status(row)
         _say(f"  overall accepted: {result.accepted}")
         # Decompose the accept gate so a False is explained, not just reported.
         # accepted = base.accepted AND no coarse-flagged interface AND every
@@ -357,48 +474,34 @@ def run_stitch(
                 "(large rotations the pipeline can't auto-verify are flagged)."
             )
 
-        # Dual-chain cross-check: with volumes also present, the image RANSAC pose is an
-        # independent second estimate. Reconcile keeps MT unless the image disagrees AND
-        # is the more certain side (sign, or shift gated on the image's own confidence).
-        if has_vol:
-            from pandorica.stitch.image_pose import reconcile_image_mt
-
+        if getattr(result, "rescues", None):
             _say("")
-            _say("--- Dual-chain cross-check (MT vs image RANSAC; volumes present) ---")
-            xc_metric = method if method != "mi" else "ncc"
-            _tx = time.perf_counter()
-            poses, xreports = reconcile_image_mt(
-                ds, poses, rows, metric=xc_metric, workers=workers, log=_say
+            _say(
+                f"--- MT rotation rescue: {len(result.rescues)} interface(s) where "
+                "the image coarse rotation failed (the dense MTs re-estimated it) ---"
             )
-            t_xcheck = time.perf_counter() - _tx
-            xflag, xoverride = [], []
-            for r in xreports:
-                rs = "img" if r["rot_src"] == "img" else "MT "
-                ts = "img" if r["t_src"] == "img" else "MT "
-                notes = [n for n, b in (("sign", r["rot_conflict"]),
-                                        ("shift", r["t_conflict"])) if b]
-                note = f"  CONFLICT({'+'.join(notes)})" if notes else ""
+            for (k, img_a, mt_a, img_m, mt_m, aniso) in result.rescues:
+                aniso_s = (f"  aniso=({aniso[0]:.3f},{aniso[1]:.3f})"
+                           if aniso is not None else "")
                 _say(
-                    f"  {r['label']:>16}: MT={r['rot_mt']:+7.1f}° img={r['rot_img']:+7.1f}°"
-                    f" gap={r['rot_gap']:4.1f}° -> rot:{rs}  dt={r['dt_px']:4.0f}px"
-                    f" -> shift:{ts}  [mf={r['match_frac']:.2f} agree={r['agree']:.2f}]{note}"
+                    f"  {ds.interface_label(k):>16}: image {img_a:+.1f}° "
+                    f"(match {img_m * 100:.0f}%)  ->  MT {mt_a:+.1f}° "
+                    f"(match {mt_m * 100:.0f}%){aniso_s}"
                 )
-                if r["flagged"]:
-                    xflag.append(r["label"])
-                if r["rot_src"] == "img" or r["t_src"] == "img":
-                    xoverride.append(r["label"])
-            if xoverride:
+
+        if getattr(result, "scale_gates", None):
+            _say("")
+            _say(
+                f"--- MT scale-gate: {len(result.scale_gates)} interface(s) where the "
+                "image-coarse scale was dropped (the dense MTs matched better "
+                "rotation-only — an overfit stretch that warps the volume corner) ---"
+            )
+            for (k, det, m_full, m_rot) in result.scale_gates:
                 _say(
-                    f"  [xcheck] image override committed on {len(xoverride)} "
-                    f"interface(s): {', '.join(xoverride)}"
+                    f"  {ds.interface_label(k):>16}: image scale det={det:.3f} "
+                    f"(match {m_full * 100:.0f}%)  ->  rotation-only "
+                    f"(match {m_rot * 100:.0f}%)"
                 )
-            if xflag:
-                _say(
-                    f"  [xcheck] {len(xflag)} interface(s) flagged (MT/image disagree): "
-                    f"{', '.join(xflag)} — verify visually."
-                )
-            else:
-                _say("  [xcheck] MT and image agree on every interface.")
     else:
         from pandorica.stitch.image_pose import image_only_poses
 
@@ -412,18 +515,19 @@ def run_stitch(
         _say("--- Image-only coarse poses (weighted-RANSAC rigid: rotation + shift) ---")
         _ts = time.perf_counter()
         poses = image_only_poses(
-            ds, metric=method if method != "mi" else "ncc", workers=workers, log=_say
+            ds, metric=method if method != "mi" else "ncc", workers=workers,
+            log=_dev, on_interface=_coarse_clean,
         )
         t_solve = time.perf_counter() - _ts
         mt_warps = None
         chain_pairs = None
         chain_accepted = None
     t_stitch = time.perf_counter() - t
-    _say("")
-    _say("--- Global per-section poses (section 0 = gauge) ---")
+    _dev("")
+    _dev("--- Global per-section poses (section 0 = gauge) ---")
     for name, p in zip(ds.names, poses):
-        _say(f"  {name:>16}: {_fmt_pose(p)}")
-    _say("")
+        _dev(f"  {name:>16}: {_fmt_pose(p)}")
+    _dev("")
 
     # --- image-fill (MT-free regions; also the fine warp for image-only) --- #
     image_warps = None
@@ -516,6 +620,13 @@ def run_stitch(
         )
     t_export = time.perf_counter() - t
 
+    if save_inspect and use_mt:
+        from pandorica.stitch.inspect import write_inspection_bundle
+        written["inspect"] = write_inspection_bundle(
+            result, ds.coords_list(), poses,
+            [s.name for s in ds.sections], join(out, "stitch_inspect.npz"),
+        )
+
     total = time.perf_counter() - t0
     _say("")
     _say("--- Outputs ---")
@@ -523,17 +634,20 @@ def run_stitch(
         _say(f"  {k:>8}: {v}")
     _say("")
     _say("--- Compute time ---")
-    _say(f"  load          : {t_load:7.1f} s")
-    _say(f"  register      : {t_stitch:7.1f} s")
+    _dev(f"  load          : {t_load:7.1f} s")
+    _dev(f"  register      : {t_stitch:7.1f} s")
     if use_mt:
-        _say(f"    mt-solve    : {t_solve:7.1f} s")
         if has_vol:
-            _say(f"    cross-check : {t_xcheck:7.1f} s")
+            _dev(f"    img-coarse  : {t_coarse:7.1f} s")
+            _dev(f"    mt-warp     : {t_solve:7.1f} s")
+        else:
+            _dev(f"    mt-solve    : {t_solve:7.1f} s")
     else:
-        _say(f"    image-pose  : {t_solve:7.1f} s")
-    _say(f"  image-fill    : {t_fill:7.1f} s")
-    _say(f"  export/warp   : {t_export:7.1f} s")
-    _say(f"  TOTAL         : {total:7.1f} s")
+        _dev(f"    image-pose  : {t_solve:7.1f} s")
+    _dev(f"  image-fill    : {t_fill:7.1f} s")
+    _dev(f"  export/warp   : {t_export:7.1f} s")
+    _dev(f"  TOTAL         : {total:7.1f} s")
+    _clean(f"  total time: {int(total // 60)}m {int(total % 60):02d}s")
 
     log_path = join(out, "stitch_log.txt")
     with open(log_path, "w") as f:

@@ -25,7 +25,7 @@ from typing import List, Optional
 import numpy as np
 
 from pandorica.stitch.dataset import Dataset
-from pandorica.stitch.transform.solver import Pose, apply_pose
+from pandorica.stitch.transform.solver import Pose, apply_pose, linear_part
 
 
 def apply_pose_to_coords(pose: Pose, coords: np.ndarray) -> np.ndarray:
@@ -89,13 +89,16 @@ def napari_affine(pose: Pose) -> np.ndarray:
     Used to align a section's **volume** image layer without resampling: set the
     image ``scale = pixel_size`` (voxel → physical) and this ``affine`` (physical
     pose). The Z axis is left identity — the warp is in-plane.
+
+    The linear block is the pose's full 2×2 ``L`` (reordered to napari's (y, x)
+    axes), so anisotropy/shear display correctly; for an isotropic pose ``L = Scale·R``
+    and this reduces to the rotation+scale form.
     """
-    a = np.deg2rad(pose["Angle"])
-    c, s, sc = np.cos(a), np.sin(a), pose["Scale"]
+    L = linear_part(pose)
     m = np.eye(4)
-    # apply_pose: x' = sc(cx - sy) + Tx ; y' = sc(sx + cy) + Ty.  Axes: (z, y, x).
-    m[1, 1], m[1, 2], m[1, 3] = sc * c, sc * s, pose["Ty"]  # y'
-    m[2, 1], m[2, 2], m[2, 3] = -sc * s, sc * c, pose["Tx"]  # x'
+    # apply_pose: x' = L00·x + L01·y + Tx ; y' = L10·x + L11·y + Ty.  Axes: (z, y, x).
+    m[1, 1], m[1, 2], m[1, 3] = L[1, 1], L[1, 0], pose["Ty"]  # y'
+    m[2, 1], m[2, 2], m[2, 3] = L[0, 1], L[0, 0], pose["Tx"]  # x'
     return m
 
 
@@ -104,15 +107,15 @@ def napari_affine_2d(pose: Pose) -> np.ndarray:
 
     The 2-D analogue of :func:`napari_affine`, for driving a section's boundary-face
     **image** layer live in the GT recorder's 2-D view (set ``scale = pixel_size``,
-    then this ``affine``).
+    then this ``affine``). The linear block is the pose's full 2×2 ``L`` (reordered to
+    napari's (y, x) axes), so anisotropy/shear display correctly.
     """
-    a = np.deg2rad(pose["Angle"])
-    c, s, sc = np.cos(a), np.sin(a), pose["Scale"]
-    # apply_pose: x' = sc(cx - sy) + Tx ; y' = sc(sx + cy) + Ty.  Axes: (y, x).
+    L = linear_part(pose)
+    # apply_pose: x' = L00·x + L01·y + Tx ; y' = L10·x + L11·y + Ty.  Axes: (y, x).
     return np.array(
         [
-            [sc * c, sc * s, pose["Ty"]],  # y'
-            [-sc * s, sc * c, pose["Tx"]],  # x'
+            [L[1, 1], L[1, 0], pose["Ty"]],  # y'
+            [L[0, 1], L[0, 0], pose["Tx"]],  # x'
             [0.0, 0.0, 1.0],
         ]
     )

@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import inspect
 import re
-import sys
 import typing
 import warnings
 from datetime import datetime

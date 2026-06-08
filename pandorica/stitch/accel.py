@@ -27,7 +27,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from pandorica.stitch.transform.solver import Pose
+from pandorica.stitch.transform.solver import Pose, linear_part
 
 
 def gpu_available() -> bool:
@@ -178,10 +178,12 @@ def warp_volume_torch(
     z, h_in, w_in = volume.shape
     hc, wc = out_hw
 
-    a = np.deg2rad(inv_pose["Angle"])
-    c, s, sc = np.cos(a), np.sin(a), inv_pose["Scale"]
-    # apply_pose(inv_pose, p) = sc * (p @ R.T) + t,  R = [[c, -s], [s, c]]
-    rt = torch.tensor([[c, s], [-s, c]], dtype=torch.float32, device=dev) * sc  # R.T
+    # apply_pose(inv_pose, p) = p @ L.T + t. Use the full 2x2 linear part so an
+    # anisotropic / sheared inverse pose warps correctly; for an isotropic pose
+    # L = Scale * R and this reduces to the old (Angle, Scale) construction.
+    rt = torch.tensor(
+        np.ascontiguousarray(linear_part(inv_pose).T), dtype=torch.float32, device=dev
+    )  # L.T
     tt = torch.tensor([inv_pose["Tx"], inv_pose["Ty"]], dtype=torch.float32, device=dev)
     out_t = torch.as_tensor(np.asarray(out_pts, np.float32), device=dev)  # [M,2]
     b_t = torch.as_tensor(np.asarray(b_grid, np.float32), device=dev)

@@ -35,11 +35,19 @@ from pandorica.stitch.coarse.coarse_hybrid import (
 )
 from pandorica.stitch.pipeline.core import (
     register_section_stack,
+    register_warps_to_coarse,
+    rescue_coarse_poses,
+    gate_coarse_scale,
     StitchResult,
 )
 from pandorica.stitch.pipeline.intensity_qc import (
     verify_rotation,
     IntensityVerification,
+)
+from pandorica.stitch.transform.solver import (
+    Pose,
+    compose_poses,
+    invert_pose,
 )
 
 # Below this |rotation| the dense-intensity test is uninformative (identity already
@@ -56,11 +64,19 @@ class SerialStitchResult:
     hybrid: HybridCoarseResult
     intensity: List[Optional[IntensityVerification]]
     accepted: bool = field(default=False)
+    # MT rotation rescues (image-coarse path only): per entry
+    # ``(k, image_angle, mt_angle, image_match, mt_match)``.
+    rescues: List = field(default_factory=list)
+    # MT scale-gates (image-coarse path only): interfaces where the image scale was
+    # dropped because rotation-only matched the MTs better. Per entry
+    # ``(k, image_det, full_match, rot_match)``.
+    scale_gates: List = field(default_factory=list)
 
 
 def stitch_sections(
     coords_list,
     section_images: Optional[Sequence] = None,
+    coarse_poses: Optional[List[Pose]] = None,
     z_band_fraction: float = 0.15,
     allow_scale: bool = False,
     lambda_scale: float = 1.0,
@@ -74,6 +90,8 @@ def stitch_sections(
     intensity_min_angle: float = _INTENSITY_MIN_ANGLE_DEG,
     warp_eps: float = 0.05,
     warp_omega_max: float = 1.0,
+    warp_tangent_weight: float = 0.0,
+    cut_vertical_jog_rho: float = 2.0,
     warp_grid_n: int = 48,
     warp_pad: float = 0.1,
     qc_min_match_fraction: float = 0.3,
@@ -88,6 +106,11 @@ def stitch_sections(
     :param coords_list: per-section spatial graphs ``[N, 4]`` in stack order.
     :param section_images: optional one 2-D boundary-face image per section, used
         for the A–P-polarity sign hint AND the dense-intensity verification.
+    :param coarse_poses: optional absolute per-section image-coarse poses (length
+        ``n``). When given, this is the **coarse→fine default**: the global pose
+        (translation + rotation + anisotropic scale) is taken from the image and the
+        MTs only fit the fine residual warp relative to it (no MT pose-solve, no
+        ``hybrid_coarse``). ``None`` (default) runs the legacy MT-pose path.
     :param cpd_coarse: use the multi-seed CPD search for the coarse rotation
         (decoy-robust, ±90° cold-start). **Default True** — it dominates the gated
         inlier sweep on realistic data and flags ambiguous interfaces rather than
@@ -111,41 +134,140 @@ def stitch_sections(
         no flagged coarse interface, AND every significant-rotation interface to be
         intensity-verified (when images are supplied).
     """
-    search_kwargs = None
-    if cpd_coarse:
-        search_kwargs = {
-            "use_cpd": True,
-            "cpd_w": cpd_w,
-            "cpd_seeds": cpd_seeds,
-            "cpd_quantile": cpd_quantile,
-        }
-    hybrid = hybrid_coarse(
-        coords_list,
-        section_images,
-        z_band_fraction=z_band_fraction,
-        continuity_tol=continuity_tol,
-        search_kwargs=search_kwargs,
-        progress=(
-            (lambda k, ntot, ang: progress("coarse", k, ntot)) if progress else None
-        ),
-    )
-    base = register_section_stack(
-        coords_list,
-        coarse_angles=hybrid.angles,
-        z_band_fraction=z_band_fraction,
-        allow_scale=allow_scale,
-        lambda_scale=lambda_scale,
-        lambda_smooth=lambda_smooth,
-        warp_eps=warp_eps,
-        warp_omega_max=warp_omega_max,
-        warp_grid_n=warp_grid_n,
-        warp_pad=warp_pad,
-        qc_min_match_fraction=qc_min_match_fraction,
-        qc_max_shift_incoherence_rho=qc_max_shift_incoherence_rho,
-        qc_max_tangent_deg=qc_max_tangent_deg,
-        progress=(lambda k, ntot: progress("register", k, ntot)) if progress else None,
-        **match_kwargs,
-    )
+    rescues: List = []
+    scale_gates: List = []
+    if coarse_poses is not None:
+        # Image-coarse mode (the coarse→fine default): the global pose — translation,
+        # rotation, anisotropic scale — is already fixed by the image and applied to
+        # the MTs upstream. Skip the MT point-cloud coarse and the MT pose-solve; the
+        # MTs only drive the fine residual warp here (register_warps_to_coarse). The
+        # "coarse rotation" we report per interface is just the relative image-pose
+        # angle, so interface_rows / continuity logging keep working.
+        warp_kw = dict(
+            z_band_fraction=z_band_fraction,
+            warp_eps=warp_eps,
+            warp_omega_max=warp_omega_max,
+            warp_grid_n=warp_grid_n,
+            warp_pad=warp_pad,
+            qc_min_match_fraction=qc_min_match_fraction,
+            qc_max_shift_incoherence_rho=qc_max_shift_incoherence_rho,
+            qc_max_tangent_deg=qc_max_tangent_deg,
+            warp_tangent_weight=warp_tangent_weight,
+            cut_vertical_jog_rho=cut_vertical_jog_rho,
+        )
+        base = register_warps_to_coarse(
+            coords_list, coarse_poses,
+            progress=(lambda k, ntot: progress("warp", k, ntot)) if progress else None,
+            **warp_kw, **match_kwargs,
+        )
+        # MT rotation rescue: on any interface where the image coarse rotation failed
+        # (the MT match collapsed below the gate), re-estimate the rotation from the
+        # dense MTs and adopt it only when it confidently beats the gate; then re-warp.
+        rescue_sk = (
+            {"use_cpd": True, "cpd_w": cpd_w, "cpd_seeds": cpd_seeds,
+             "cpd_quantile": cpd_quantile}
+            if cpd_coarse else None
+        )
+        # Trigger the rescue on the UN-bootstrapped single-pass match: the warp
+        # bootstrap can lift a collapsed interface above the gate, which would hide a
+        # grossly wrong rotation from the rescue (and the rescue compares single-pass
+        # MT vs single-pass image, so the signals must match).
+        coarse_poses, rescues = rescue_coarse_poses(
+            coords_list, list(coarse_poses),
+            [it.confidence.get("match_fraction_single", it.qc.match_fraction)
+             for it in base.interfaces],
+            z_band_fraction=z_band_fraction, match_gate=qc_min_match_fraction,
+            search_kwargs=rescue_sk, **match_kwargs,
+        )
+        # Scale-gate: drop an image-coarse scale the MTs reject (rotation-only matches
+        # clearly better). The affine refine can overfit a both-axes stretch that the
+        # rotation rescue above never catches — such an interface still matches above the
+        # gate, it just warps the volume corner. Runs on the (possibly rescued) chain;
+        # the two passes target disjoint interfaces.
+        # Reuse the first pass's full-pose match for the scale-gate (the score it would
+        # otherwise re-register); force a fresh score on any rescued interface, whose rel
+        # changed so the first-pass match no longer describes it.
+        rescued_ks = {r[0] for r in rescues}
+        reused_full_mf = [
+            None if k in rescued_ks
+            else base.interfaces[k].confidence.get("match_fraction")
+            for k in range(len(base.interfaces))
+        ]
+        coarse_poses, scale_gates = gate_coarse_scale(
+            coords_list, list(coarse_poses),
+            z_band_fraction=z_band_fraction, match_gate=qc_min_match_fraction,
+            full_match_fractions=reused_full_mf,
+            **match_kwargs,
+        )
+        if rescues or scale_gates:
+            # Only the rescued/gated interfaces changed their relative pose; every other
+            # interface's relative pose — and hence its warp residual — is invariant to the
+            # upstream correction, so re-warp ONLY the changed interfaces and reuse the rest
+            # from the first pass. (The blanket re-pass over all interfaces was the bulk of
+            # the Monopoles 2x: 2 interfaces rescued, all 10 re-warped.)
+            changed = sorted({r[0] for r in rescues} | {g[0] for g in scale_gates})
+            new_ifaces = list(base.interfaces)
+            for j, k in enumerate(changed):
+                if progress is not None:
+                    progress("rescue-warp", j, len(changed))
+                one = register_warps_to_coarse(
+                    coords_list[k:k + 2], coarse_poses[k:k + 2],
+                    **warp_kw, **match_kwargs,
+                )
+                if one.interfaces:
+                    new_ifaces[k] = one.interfaces[0]
+            base = StitchResult(
+                poses=[dict(p) for p in coarse_poses],
+                interfaces=new_ifaces,
+                accepted=all(r.qc.accepted for r in new_ifaces),
+            )
+        rels = [
+            compose_poses(invert_pose(coarse_poses[k]), coarse_poses[k + 1])
+            for k in range(len(coarse_poses) - 1)
+        ]
+        hybrid = HybridCoarseResult(
+            angles=[float(r["Angle"]) for r in rels], records=[], estimates=[]
+        )
+    else:
+        search_kwargs = None
+        if cpd_coarse:
+            search_kwargs = {
+                "use_cpd": True,
+                "cpd_w": cpd_w,
+                "cpd_seeds": cpd_seeds,
+                "cpd_quantile": cpd_quantile,
+            }
+        hybrid = hybrid_coarse(
+            coords_list,
+            section_images,
+            z_band_fraction=z_band_fraction,
+            continuity_tol=continuity_tol,
+            search_kwargs=search_kwargs,
+            progress=(
+                (lambda k, ntot, ang: progress("coarse", k, ntot)) if progress else None
+            ),
+        )
+        base = register_section_stack(
+            coords_list,
+            coarse_angles=hybrid.angles,
+            z_band_fraction=z_band_fraction,
+            allow_scale=allow_scale,
+            lambda_scale=lambda_scale,
+            lambda_smooth=lambda_smooth,
+            warp_eps=warp_eps,
+            warp_omega_max=warp_omega_max,
+            warp_tangent_weight=warp_tangent_weight,
+            cut_vertical_jog_rho=cut_vertical_jog_rho,
+            warp_grid_n=warp_grid_n,
+            warp_pad=warp_pad,
+            qc_min_match_fraction=qc_min_match_fraction,
+            qc_max_shift_incoherence_rho=qc_max_shift_incoherence_rho,
+            qc_max_tangent_deg=qc_max_tangent_deg,
+            progress=(
+                (lambda k, ntot: progress("register", k, ntot)) if progress else None
+            ),
+            **match_kwargs,
+        )
 
     intensity: List[Optional[IntensityVerification]] = []
     intensity_ok = True
@@ -174,4 +296,6 @@ def stitch_sections(
         hybrid=hybrid,
         intensity=intensity,
         accepted=accepted,
+        rescues=rescues,
+        scale_gates=scale_gates,
     )

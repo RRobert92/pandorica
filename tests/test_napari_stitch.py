@@ -31,7 +31,7 @@ from pandorica.stitch.pipeline.stitcher import stitch_sections
 from pandorica.stitch import image_warp as iw
 from pandorica.stitch import accel as accel
 from pandorica.stitch import image_pose as ip
-from pandorica.stitch.transform.solver import apply_pose, IDENTITY
+from pandorica.stitch.transform.solver import apply_pose, pose_from_matrix, IDENTITY
 
 
 # --------------------------------------------------------------------------- #
@@ -73,6 +73,29 @@ def test_centroid_pose_fixes_center():
     assert np.allclose(apply_pose(pose, c[None])[0], c)  # centre is invariant
 
 
+def test_centroid_pose_anisotropic_matches_display_helper():
+    # Independent (sx, sy): centre still invariant under pure scale+rotation, and the
+    # pose's affine must equal the GT recorder's display helper apply_anisotropic_xy.
+    c = np.array([30.0, -10.0])
+    xy = np.array([[12.0, 3.0], [-4.0, 22.0], [30.0, -10.0]])
+    pose = geo.centroid_pose(18.0, 7.0, -2.0, c, sx=1.15, sy=0.9)
+    expected = npg.apply_anisotropic_xy(xy, 18.0, 7.0, -2.0, 1.15, 0.9, c)
+    assert np.allclose(apply_pose(pose, xy), expected)
+    # centre maps to centre + (tx, ty) (only the translation moves it)
+    assert np.allclose(apply_pose(pose, c[None])[0], c + np.array([7.0, -2.0]))
+
+
+def test_pose_to_pixel_preserves_anisotropic_linear_part():
+    # An anisotropic pose must stay anisotropic through the pixel conversion: the
+    # linear part (L) is unchanged, only the translation is divided by pixel size.
+    pose = geo.centroid_pose(12.0, 100.0, -40.0, np.array([0.0, 0.0]), sx=1.2, sy=0.85)
+    p = geo.pose_to_pixel(pose, pixel_size=10.0)
+    for key in ("L00", "L01", "L10", "L11"):
+        assert p[key] == pytest.approx(pose[key])
+    assert p["Tx"] == pytest.approx(pose["Tx"] / 10.0)
+    assert p["Ty"] == pytest.approx(pose["Ty"] / 10.0)
+
+
 def test_napari_affine_2d_matches_apply_pose():
     pose = {"Angle": -28.0, "Tx": 7.0, "Ty": 3.0, "Scale": 0.9}
     xy = np.array([[2.0, 9.0], [-4.0, 1.0]])
@@ -80,6 +103,21 @@ def test_napari_affine_2d_matches_apply_pose():
     yx1 = np.column_stack([xy[:, 1], xy[:, 0], np.ones(len(xy))])
     got = (A @ yx1.T).T[:, [1, 0]]  # (x', y')
     assert np.allclose(got, apply_pose(pose, xy))
+
+
+def test_napari_affines_match_apply_pose_anisotropic():
+    # Both the 2-D and 3-D napari affines must reproduce apply_pose for an
+    # anisotropic + sheared pose, i.e. honour the full 2×2 L, not just Angle/Scale.
+    pose = pose_from_matrix(np.array([[1.1, 0.07], [-0.05, 0.92]]), np.array([7.0, 3.0]))
+    xy = np.array([[2.0, 9.0], [-4.0, 1.0], [11.0, -6.0]])
+
+    A2 = npg.napari_affine_2d(pose)
+    yx1 = np.column_stack([xy[:, 1], xy[:, 0], np.ones(len(xy))])
+    assert np.allclose((A2 @ yx1.T).T[:, [1, 0]], apply_pose(pose, xy))
+
+    A3 = npg.napari_affine(pose)
+    zyx1 = np.column_stack([np.zeros(len(xy)), xy[:, 1], xy[:, 0], np.ones(len(xy))])
+    assert np.allclose((A3 @ zyx1.T).T[:, [2, 1]], apply_pose(pose, xy))
 
 
 def test_zmax_face_picks_correct_end():
@@ -157,6 +195,39 @@ def test_export_stitched_volume_and_graph(tmp_path, monkeypatch):
     lattice = next(ln for ln in head.splitlines() if "define Lattice" in ln)
     z = int(lattice.split()[-1])
     assert z == 8
+
+
+def test_export_no_volume_stacks_graph_in_z(tmp_path):
+    # MT-only export (write_volume=False): no volumes means no slice counts to
+    # stack the graph in Z. The Z offset must come from each section's own MT
+    # Z-extent — otherwise every section lands at Z=0 and the graph collapses onto
+    # one plane (the flat-slab bug). Each section's MTs span [0, thick] locally;
+    # stacked over n sections the output must span ~n*thick, not ~thick.
+    import re
+
+    n, thick = 3, 100.0
+    coords = np.array([[0, 5.0, 5.0, 0.0], [0, 7.0, 9.0, thick]])
+    ds = io.Dataset(
+        folder=str(tmp_path),
+        sections=[
+            io.Section(name=f"s{i}", index=i, image_path=None, coord_path=None,
+                       coords=coords.copy(), pixel_size=1.0)
+            for i in range(n)
+        ],
+    )
+    poses = [dict(IDENTITY) for _ in range(n)]
+    written = st.export_stitched(ds, poses, str(tmp_path / "out"), write_volume=False)
+
+    txt = open(written["graph"], errors="replace").read()
+    pts = np.array(
+        [[float(a) for a in ln.split()]
+         for ln in txt.splitlines()
+         if len(ln.split()) == 3 and re.match(r"^-?\d", ln.strip())]
+    )
+    # the stacking axis (the one section thickness landed on) spans ~n sections;
+    # the tiny XY axes span only a few units, so the max-span column is Z.
+    zspan = max(float(np.ptp(pts[:, j])) for j in range(3))
+    assert (n - 0.5) * thick < zspan < (n + 0.5) * thick
 
 
 class _MockWarp:
@@ -318,6 +389,39 @@ def test_gpu_warp_matches_cpu_zblend():
     assert np.mean(np.abs(cpu.astype(int) - gpu.astype(int))) < 2.0
 
 
+def test_gpu_warp_matches_cpu_zblend_anisotropic():
+    # Same CPU/GPU equivalence but with an anisotropic + sheared inverse pose, to
+    # confirm warp_volume_torch consumes the full 2×2 L (not just Angle/Scale).
+    rng = np.random.default_rng(1)
+    vol = (rng.random((3, 40, 50)) * 255).astype(np.uint8)
+    hc, wc = 40, 50
+    yy, xx = np.meshgrid(np.arange(hc), np.arange(wc), indexing="ij")
+    out_pts = np.column_stack([xx.ravel(), yy.ravel()]).astype(float)
+    b = np.tile([2.0, -1.0], (out_pts.shape[0], 1))
+    t = np.zeros_like(out_pts)
+    # Mild aniso + shear about the image centre so most samples stay in-bounds.
+    L = np.array([[1.08, 0.06], [-0.04, 0.93]])
+    c = np.array([wc / 2.0, hc / 2.0])
+    inv = pose_from_matrix(L, c - L @ c)
+    cpu = st._warp_volume_zblend(vol, inv, (hc, wc), out_pts, b, t)
+    gpu = accel.warp_volume_torch(
+        vol, inv, (hc, wc), out_pts, b, t, device="cpu", chunk=2
+    )
+    assert cpu.shape == gpu.shape
+    # Looser than the near-identity case: the aniso warp pushes more samples to the
+    # volume edge, where scipy map_coordinates(mode="constant") and torch
+    # grid_sample(padding_mode="zeros") differ on boundary bilinear weights. The
+    # interior agrees to ~1 intensity; a real L mismatch would be tens–hundreds.
+    assert np.mean(np.abs(cpu.astype(int) - gpu.astype(int))) < 5.0
+    # Guard: dropping L (falling back to the isotropic Angle/Scale view) must change
+    # the warp — proving the anisotropy/shear is really being applied, not ignored.
+    iso = {k: v for k, v in inv.items() if not k.startswith("L")}
+    gpu_iso = accel.warp_volume_torch(
+        vol, iso, (hc, wc), out_pts, b, t, device="cpu", chunk=2
+    )
+    assert np.mean(np.abs(gpu.astype(int) - gpu_iso.astype(int))) > 1.0
+
+
 def test_export_zblend_differs_from_uniform(tmp_path, monkeypatch):
     monkeypatch.setattr(io.Section, "drop_volume", lambda self: None)
     vol = np.zeros((4, 30, 40), np.uint8)
@@ -342,6 +446,31 @@ def test_export_zblend_differs_from_uniform(tmp_path, monkeypatch):
     uni = open(str(tmp_path / "uni" / "stitched_volume.am"), "rb").read()
     zb = open(str(tmp_path / "zb" / "stitched_volume.am"), "rb").read()
     assert uni != zb  # Z-blend (symmetric, per-slice) differs from uniform warp
+
+
+def test_export_carries_anisotropy_end_to_end(tmp_path, monkeypatch):
+    # Full pipeline: an anisotropic section pose must propagate
+    # pose -> pose_to_pixel -> canvas bbox -> applier inverse-map -> .am output. We
+    # export the same pose with and without its L keys (the latter falls back to the
+    # isotropic polar Angle/Scale view) and require the written volumes to differ.
+    monkeypatch.setattr(io.Section, "drop_volume", lambda self: None)
+    vol = np.zeros((3, 40, 40), np.uint8)
+    vol[:, 12:28, 8:32] = 200  # off-square so an x vs y stretch is visible
+    c = np.array([[0, 40.0, 40.0, 2.0], [0, 40.0, 40.0, 4.0]])
+
+    def make_ds():
+        return io.Dataset(folder=str(tmp_path), sections=[
+            _mem_section("s0", 0, vol.copy(), 2.0, c.copy()),
+            _mem_section("s1", 1, vol.copy(), 2.0, c.copy()),
+        ])
+
+    aniso = geo.centroid_pose(8.0, 4.0, -3.0, np.array([40.0, 40.0]), sx=1.3, sy=0.8)
+    iso = {k: v for k, v in aniso.items() if not k.startswith("L")}  # polar similarity
+    st.export_stitched(make_ds(), [dict(IDENTITY), aniso], str(tmp_path / "aniso"))
+    st.export_stitched(make_ds(), [dict(IDENTITY), iso], str(tmp_path / "iso"))
+    a = open(str(tmp_path / "aniso" / "stitched_volume.am"), "rb").read()
+    i = open(str(tmp_path / "iso" / "stitched_volume.am"), "rb").read()
+    assert a != i
 
 
 # --------------------------------------------------------------------------- #

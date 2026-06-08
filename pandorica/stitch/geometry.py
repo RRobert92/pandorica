@@ -30,7 +30,7 @@ from typing import Dict, List
 import numpy as np
 
 from pandorica.stitch.transform.scale import boundary_landmarks
-from pandorica.stitch.transform.solver import Pose
+from pandorica.stitch.transform.solver import Pose, pose_from_matrix
 
 # Intuitive Z-up face → extract_boundary_endpoints' (backwards) labels, mirroring
 # core._FACE_LABEL: "top" = high-Z face, "bottom" = low-Z face.
@@ -56,14 +56,20 @@ def endpoints_xy(endpoints: List[Dict]) -> np.ndarray:
 
 
 def pose_to_pixel(pose: Pose, pixel_size: float) -> Pose:
-    """Convert a physical-unit pose to pixel units (rotation/scale unchanged)."""
+    """Convert a physical-unit pose to pixel units (linear part unchanged).
+
+    Only the translation has length units, so only ``Tx, Ty`` are divided by the
+    pixel size. The linear part — rotation, isotropic **or** anisotropic scale, and
+    shear — is invariant under uniform pixel scaling, so the ``L*`` keys (and the
+    derived ``Angle``/``Scale`` view) are carried through untouched. Carrying ``L``
+    is what keeps an anisotropic pose anisotropic through to the volume applier;
+    rebuilding from ``Angle``/``Scale`` alone would silently drop ``(sx, sy)``/shear.
+    """
     px = pixel_size if pixel_size else 1.0
-    return {
-        "Angle": pose["Angle"],
-        "Tx": pose["Tx"] / px,
-        "Ty": pose["Ty"] / px,
-        "Scale": pose["Scale"],
-    }
+    out = dict(pose)
+    out["Tx"] = pose["Tx"] / px
+    out["Ty"] = pose["Ty"] / px
+    return out
 
 
 def zmax_face(
@@ -93,26 +99,30 @@ def centroid_pose(
     ty: float,
     center_xy: np.ndarray,
     scale: float = 1.0,
+    sx: float = None,
+    sy: float = None,
 ) -> Pose:
     """
-    Pose that scales by ``scale`` and rotates by ``angle_deg`` about ``center_xy``,
-    then translates by ``(tx, ty)``.
+    Pose that scales then rotates by ``angle_deg`` about ``center_xy``, then
+    translates by ``(tx, ty)``.
 
     Natural parametrisation for the GT recorder: rotating and scaling the moving
     face about its own centroid keeps it near the fixed face while the operator
     dials in angle / scale, then ``(tx, ty)`` nudges it into place. Equivalent to
-    ``x' = scale·R·(x − c) + c + (tx, ty)`` — a centred similarity transform.
-    Default ``scale=1.0`` preserves the prior signature (rigid-only callers
-    don't need to opt in).
+    ``x' = R · diag(sx, sy) · (x − c) + c + (tx, ty)`` — a centred affine.
+
+    ``sx``/``sy`` default to ``scale`` (isotropic), so the prior similarity
+    signature ``centroid_pose(angle, tx, ty, c, scale)`` is preserved exactly. Pass
+    independent ``sx, sy`` to record anisotropic in-plane compression (the linear
+    part becomes ``R · diag(sx, sy)``, matching ``napari._geometry``'s aniso
+    convention). The full linear part is stored in the ``L*`` keys; ``Angle``/``Scale``
+    are its polar-decomposition view.
     """
     a = np.deg2rad(angle_deg)
     R = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
+    sx = float(scale) if sx is None else float(sx)
+    sy = float(scale) if sy is None else float(sy)
+    L = R @ np.diag([sx, sy])
     c = np.asarray(center_xy, dtype=float)
-    s = float(scale)
-    t = c - s * (R @ c) + np.array([tx, ty], dtype=float)
-    return {
-        "Angle": float(angle_deg),
-        "Tx": float(t[0]),
-        "Ty": float(t[1]),
-        "Scale": s,
-    }
+    t = c - L @ c + np.array([tx, ty], dtype=float)
+    return pose_from_matrix(L, t)

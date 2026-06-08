@@ -20,7 +20,7 @@ almost as well. So ``image_pose`` cross-checks its angle against the independent
 here and **flags** the interface on disagreement — it keeps its own RANSAC rotation
 either way (a review signal, not an override). Independence is the point: a plain
 boundary-face NCC ``argmax`` can sit at the noise floor at every angle (the failure that
-motivated this module — see tmp/coarse_warp/DISCOVERIES.md), so a pixel-similarity peak
+motivated this module), so a pixel-similarity peak
 alone can't be trusted to pick the angle — geometry is steadier.
 
 It recovers rotation from **geometry**, the same principle the MT path uses (match a

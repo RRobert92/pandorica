@@ -5,6 +5,250 @@ All notable changes to pandorica are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] — 2026-06-07
+
+Cleanup, performance, and documentation pass on top of the 1.4.0 alignment work —
+no behaviour change, every output numerically identical.
+
+### Changed
+
+- **Faster warp phase on stacks that trip the rescue / scale-gate.** When an interface
+  was rescued or scale-gated, the fine-warp stage re-ran `register_warps_to_coarse` over
+  **every** interface — but only the corrected ones change (an interface's relative pose,
+  hence its warp residual, is invariant to the upstream correction). It now re-warps
+  **only the changed interfaces** and reuses the rest from the first pass. Separately,
+  `gate_coarse_scale` recomputed each interface's full-pose match the first pass already
+  had; it now reuses it (`full_match_fractions`), recomputing only a rescued interface's.
+  On a real 11-section stack (Mac/MPS) the warp phase dropped **463.6 s → 332.0 s
+  (−28 %)** — the second pass touched 2 interfaces instead of 10 — with bit-identical
+  warps (new slice==full-pass and reuse==recompute tests assert it).
+
+### Removed
+
+- **Research scaffolding stripped from production comments.** Removed pointers to `tmp/`
+  probe scripts, `DISCOVERIES.md`, and "reverted mistake" lab-notes from `image_pose.py`,
+  `contour_rotation.py`, and `core.py` (the design rationale they annotated is kept), plus
+  one unused import.
+
+### Documentation
+
+- Reframed the main README, `stitch/README.md`, and `HOW_IT_WORKS.md` around the current
+  **image-driven coarse→fine** default (the image fixes the global pose including the
+  anisotropic stretch; MTs drive only the fine warp) instead of the old "MT-driven with
+  image fallback" framing. Documented the MT rotation **rescue** + anisotropy recovery,
+  the **chain/warp decouple**, the tangent-continuity term, the near-vertical jog cut, and
+  the napari **Warp / Match Inspector** + `--save-inspect` bundle.
+
+## [1.4.0] — 2026-06-07
+
+### Added
+
+- **The MT rescue now recovers a failed interface's *anisotropy*, not just its rotation.**
+  The image coarse fits each interface's anisotropic stretch (`aniso=(sx,sy)`) and that stretch
+  is applied to both the volume and the microtubules — *except* on an interface whose image
+  coarse fails catastrophically (no nuclear contour / near-circular symmetry → a grossly wrong
+  rotation, e.g. −140°). The MT rotation-rescue corrected the rotation there but left the
+  interface isotropic, so its real ~10–14 % stretch was applied **nowhere**: the sections did
+  not line up (a visible gap), and the residual warp had to absorb the whole stretch, tripping
+  the vorticity guard and being rejected. The rescue now, after locking the rotation, fits an
+  anisotropic affine to the **dense bootstrapped** MT correspondences (the stretch lives in the
+  peripheral MTs, which only match once the warp bootstrap pulls them in) and adopts it only
+  when the residual stretch is genuine (> 5 %) **and** it improves the match — the symmetric
+  inverse of the scale-gate, which *drops* a bad image scale. On a dense stack the worst
+  interface recovered `aniso=(1.01, 0.95)`, its match rose 37 % → 83 %, and its residual warp
+  dropped under the guard so it now **passes** (rejected → accepted), closing ~72 % of the
+  boundary gap. The gate stays clean — a healthy interface's residual stretch is ~1 % (the image
+  already applied its aniso), well under the gate, so the recovery never fires there.
+
+- **A gentle, guarded tangent-continuity term in the fine warp (`--warp-tangent-weight`).**
+  The fine warp aligned matched microtubule-stub *positions* but not their *directions*, so a
+  matched pair could be positionally aligned yet still kink ("stair") at the seam. The warp now
+  optionally adds tangent-step correspondences that pull each matched **shallow**-MT stub's
+  in-plane tangent partway toward continuing smoothly across the seam. It is soft (default weight
+  `0.4`) and stays subordinate to the vorticity/detJ guard, so it never forces a whirlpool — and
+  it never fully erases a kink, so a *wrongly* matched pair keeps a residual stair rather than
+  being smoothed into a convincing fake. Only pairs with a reliable in-plane tangent participate
+  (`|tan_xy| > 0.2`); near-vertical stubs — which have no usable in-plane direction and no
+  in-plane stair to begin with — are left alone. It reduces the per-joint tangent discontinuity
+  where there is a systematic small kink (one interface: mean 10.6° → 4.4°), never newly rejects
+  a warp, and is off at `0`.
+
+- **Near-vertical wrong matches the chain split can't judge are now cut as local outliers
+  (`--cut-vertical-jog-rho`).** The chain split severs a joint when the two microtubule halves
+  point different ways — but a near-vertical stub has no reliable in-plane direction, so split is
+  blind to it, and a wrong such match (two different MTs joined by a lateral jog) survived. The
+  fine-warp stage now drops, before chaining, any near-vertical matched pair (in-plane tangent
+  magnitude below `0.2` on either side) whose coarse displacement **disagrees with its local
+  neighbourhood** by more than a threshold (default `2ρ`; `0` disables). The local-consensus
+  test matters: a wrong match is a *local outlier*, whereas a true pair sitting in a deformed
+  region also has a large *absolute* jog (and the warp bootstrap recovers it) — so cutting on
+  absolute jog also removes good pairs, while the deviation from the smooth local field is
+  specific to a bad match. It fires only a handful of times per interface (≈15 across a 10-section
+  dense stack) — a small correctness win that removes the split-blind stairs without touching the
+  well-matched bulk.
+
+## [1.3.0] — 2026-06-07
+
+### Fixed
+
+- **Microtubules now chain across an interface whose fine warp is rejected, as long
+  as the matches themselves are trustworthy.** Chaining was gated on the full
+  per-interface QC, which folds in the warp's diffeomorphism certificate. But that
+  certificate answers whether the fine warp is safe to apply to the *volume pixels* —
+  a different question from whether the *correspondences* are good enough to connect
+  microtubules. On a genuinely harder serial-section join (low overlap, shallow MTs,
+  a real non-rigid shear), the matches can be perfectly coherent (74 % matched, shift
+  incoherence well inside the gate) while the residual warp carries a *distributed*
+  twist whose vorticity exceeds the bound — so the warp is rejected, the interface is
+  rejected, `chain_filaments` skips it wholesale, and *every* microtubule across that
+  joint is dropped. The section showed zero connections despite healthy matches.
+  A new `InterfaceQC.chainable` flag now carries the match-quality verdict (match
+  fraction + shift coherence) independently of the warp certificate; chaining keys off
+  `chainable` while the certificate still gates the pixel warp (the volume already
+  falls back to the rigid coarse where a warp is rejected). The existing orient→split
+  pass still cuts any individual joints whose two halves do not continue, so a
+  coherent-but-bent interface connects the microtubules it can and drops only the few
+  that genuinely do not line up. On a dense stack the worst interface went from **0 to
+  759** connected cross-section filaments (70 of 829 chained pairs cut by the geometric
+  split), with every healthy interface byte-identical. The per-interface report now
+  shows a `chained=` column and flags "warp flagged but MTs chained" so a rejected warp
+  that still connects is explicit. Note: an interface cleaned this way still has the
+  genuine deformation it could not warp away — a *quality* concern (the volume falls
+  back to coarse there), no longer a *connectivity* one.
+
+### Added
+
+- **A napari "Warp / Match Inspector" widget, fed by a new `--save-inspect` CLI flag.**
+  Diagnosing why one interface mis-aligns previously meant re-running the whole stitch.
+  `pandorica stitch --save-inspect` now writes a compact `stitch_inspect.npz` alongside
+  the outputs: for every interface it stores the matched endpoint pairs, the warp
+  displacement field sampled on a grid, its `|curl|`, and the QC verdict — all in the
+  graph-output frame (via the same framed-warp transform the export uses, so the bundle
+  overlays the written spatial graph). The new dock widget loads that bundle and, per
+  interface, overlays the match residual lines (coloured green→red by residual length),
+  the warp displacement quiver, and the `|curl|` heatmap, so you can see exactly which
+  matches or warp regions misbehave — and inspect a 15-minute stitch in seconds without
+  recomputing it.
+
+## [1.2.2] — 2026-06-06
+
+### Fixed
+
+- **An overfit image-coarse scale no longer warps a section's volume corner.** The
+  image coarse fits a per-interface anisotropic stretch, and a mild one is correct —
+  it is the knife/beam compression, and applying it makes the microtubules match
+  *better*. But the affine refine only gated the stretch's *anisotropy ratio*, never
+  its absolute *area*, so on an occasional interface it committed a non-physical
+  both-axes inflation (a real case: a 12 %-area stretch two adjacent serial sections
+  cannot show). That stretch leaves the section centre roughly right but throws the
+  far corner by thousands of Å — the "top corner doesn't line up" artifact — and the
+  guarded residual warp cannot undo a global area change. Two complementary guards now
+  catch it: (1) `image_only_poses` clamps each committed residual-affine's singular
+  values and determinant into a physical band (keeping its orientation), reining a
+  gross overfit even with no microtubules to consult; and (2) a microtubule
+  **scale-gate** (`gate_coarse_scale`) validates every non-trivial-scale interface
+  against the dense MTs — if rotation-only matches clearly better than the full image
+  pose, the scale is dropped to rotation-only and the pose chain re-accumulated. The
+  gate is the scale analogue of the existing rotation rescue and fires only where a
+  scale genuinely hurts: on a real dense stack it corrected exactly the one outlier
+  interface (matched fraction 49 % → 76 %, the corner stretch from ~5200 Å to 0)
+  while leaving every interface whose anisotropy *helps* the microtubules untouched.
+
+## [1.2.1] — 2026-06-06
+
+### Changed
+
+- **The fine MT warp now bootstraps its correspondences, recovering cross-gap
+  microtubules a single match drops.** Where the image coarse leaves a
+  *spatially-varying* residual (a few ρ, not a uniform offset), true MT partners
+  land at 2–3 ρ instead of the <1 ρ a tight interface shows, and the matcher's
+  rigid-residual and smoothness gates — tuned for near-rigid co-location — reject
+  those displaced-but-correct pairs. `register_warps_to_coarse` now iterates
+  match → fit guarded warp → re-match: each pass pre-warps the moving endpoints so
+  the true partners reach <1 ρ and the *unchanged* tight gates accept them
+  (a false neighbour is not pulled coherently by a smooth field, so it still
+  fails — the match plateaus at its true level rather than running away). The
+  bootstrap only *discovers* the correspondences; a single foldover-guarded warp
+  is then re-fit from them in the original coarse frame, so the export still
+  carries one field per interface. On a dense microtubule stack this lifted the
+  two weak interfaces from 35 % → 49 % and 42 % → 63 % matched while every healthy
+  interface held or improved, with no degradation or false-match runaway across
+  low-drift, large-rotation, and near-achiral stacks. The rotation rescue now
+  keys off the un-bootstrapped single-pass match so the bootstrap cannot lift a
+  collapsed interface above the gate and hide a grossly wrong rotation.
+
+### Fixed
+
+- **Microtubule-only (no-volume) exports no longer collapse the stitched graph
+  into a single plane.** The per-section Z offset used to stack the graph was
+  taken from the volume's slice count, which does not exist when stitching
+  spatial graphs without volumes — so every section landed at Z = 0 and the
+  microtubules piled onto one flat slab. The no-volume export path now derives
+  each section's thickness from its own microtubule Z-extent, so the sections
+  stack flush as they do with volumes.
+
+## [1.2.0] — 2026-06-05
+
+### Changed
+
+- **`pandorica stitch` is now an image-driven coarse→fine pipeline.** When a
+  stack has volumes, the global per-section pose — translation, rotation, **and
+  anisotropic scale** — is estimated from the image (`image_only_poses`) and
+  applied to *both* the volume and the microtubule graph; the microtubules then
+  fit only the fine residual warp on top of it (`register_warps_to_coarse`),
+  instead of the global pose being solved from MT correspondences. This matches
+  the serial-section physics: the diamond knife and the e-beam "baking" deform
+  each section partly as a global anisotropic stretch (which the image recovers
+  reliably) and partly in a spatially varying way (which a single affine cannot
+  hold, so it belongs in the MT-driven warp — fitting a global affine from MT
+  correspondences overfits it). The legacy MT point-cloud coarse + global pose
+  solve is retained only as the **no-volume fallback**, and the image↔MT
+  dual-chain reconcile is dropped from the default path (the image *is* the pose
+  now, not a cross-check). `run_stitch`'s signature is unchanged, so the CLI
+  flags and the `tardis_stitch` wrapper are unaffected.
+
+- **Block-match windows now scale with the boundary-face size.** Three
+  estimators — the coarse translation match, the anisotropic affine refine, and
+  the MT-free image-fill — used fixed pixel windows calibrated for ~1024 px
+  faces. At the production load downscale the faces are ~2048 px, so each cell
+  covered half the physical structure: this halved the RANSAC inlier agreement
+  (≈0.16 vs 0.32, destabilising the translation) and starved the affine fit so
+  the anisotropic scale never committed. The translation and affine
+  windows/grids now scale with the face (floored so ≤1024 px faces — and every
+  unit test — are byte-for-byte unchanged), and the image-fill search radius was
+  raised from 16 to 64 px. On a real chiral stack this lifted per-interface MT
+  match fractions from ~26–43 % to ~60–68 % (all clearing the QC gate), made the
+  anisotropic scale commit at the production resolution, and turned the
+  image-fill from ~0 to 4/4 interfaces filled.
+
+### Added
+
+- **Anisotropic-affine pose (the L-matrix superset).** A pose now stores its
+  full 2×2 linear part (`L00, L01, L10, L11`) as the source of truth — it
+  composes by matrix multiply and carries independent `(sx, sy)` scale and shear
+  that the polar `{Angle, Tx, Ty, Scale}` view cannot represent — with the polar
+  form derived for display and reconstructed when a pose has no `L`. The linear
+  part threads end-to-end (the solver, `centroid_pose` / `pose_to_pixel`, the GPU
+  and napari warp appliers, and the image affine refine), so the anisotropic
+  coarse scale reaches the exported volume and spatial graph.
+
+- **`register_warps_to_coarse` — the image-coarse fine seam.** Fits each
+  interface's foldover-guarded MT residual warp *relative to* a supplied
+  image-coarse pose chain, with no rigid/affine re-fit from the MT
+  correspondences. `stitch_sections` gained a `coarse_poses` parameter that
+  routes through it, `_evaluate_seed(fit=False)` keeps a supplied pose as the
+  committed relative transform, and MT-free interfaces yield a pose-accepted,
+  warp-less record (the image-fill covers them). New tests in
+  `tests/test_warps_to_coarse.py`.
+
+### Deprecated
+
+- **MT-derived global pose.** The microtubule point-cloud coarse, the MT global
+  pose solve (`global_pose_refine`, including its `allow_affine` mode), and the
+  image↔MT `reconcile_image_mt` cross-check are no longer used by
+  `pandorica stitch` when volumes are present — they run only on the no-volume
+  fallback. They remain in the library for now.
+
 ## [1.1.6] — 2026-06-05
 
 ### Changed

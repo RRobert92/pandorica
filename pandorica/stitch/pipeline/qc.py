@@ -78,6 +78,7 @@ class InterfaceQC:
 
     accepted: bool
     field_passed: bool
+    chainable: bool
     match_fraction: float
     shift_incoherence_rho: float
     tangent_discontinuity_deg: float
@@ -138,9 +139,21 @@ def assess_interface(
     tangent = tangent_discontinuity_deg(ref_dirs, mov_dirs)
     _ = max_tangent_deg  # retained for API/back-compat; intentionally not gated
 
+    # Chaining trustworthiness is independent of the warp certificate: the warp
+    # certificate governs whether the fine *pixel* warp is safe to apply, but MT
+    # chaining only needs trustworthy correspondences. An interface whose matches
+    # are coherent (fraction + shift) is safe to CHAIN even when its warp is too
+    # twisty to apply — the volume already falls back to coarse there, and the
+    # downstream orient/split cuts any individual joints that don't continue.
+    chainable = (
+        match_fraction >= min_match_fraction
+        and incoherence <= max_shift_incoherence_rho
+    )
+
     return InterfaceQC(
         accepted=len(reasons) == 0,
         field_passed=field_certificate.passed,
+        chainable=chainable,
         match_fraction=match_fraction,
         shift_incoherence_rho=incoherence,
         tangent_discontinuity_deg=tangent,

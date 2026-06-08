@@ -11,6 +11,9 @@ contributions:
     - id: pandorica.spatial_graph_inspector
       python_name: pandorica.napari._widget:SpatialGraphInspectorWidget
       title: Spatial Graph Inspector
+    - id: pandorica.warp_match_inspector
+      python_name: pandorica.napari._widget:WarpMatchInspectorWidget
+      title: Warp / Match Inspector
     - id: pandorica.read_amiramesh
       python_name: pandorica.napari._reader:napari_get_reader
       title: Read AmiraMesh (.am)
@@ -21,6 +24,8 @@ contributions:
       display_name: Coarse GT Recorder
     - command: pandorica.spatial_graph_inspector
       display_name: Spatial Graph Inspector
+    - command: pandorica.warp_match_inspector
+      display_name: Warp / Match Inspector
   readers:
     - command: pandorica.read_amiramesh
       filename_patterns: ["*.am"]

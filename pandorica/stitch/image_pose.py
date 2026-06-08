@@ -38,6 +38,7 @@ from pandorica.stitch.transform.solver import (
     Pose,
     compose_poses,
     invert_pose,
+    pose_from_matrix,
 )
 from pandorica.stitch.transform.applier import (
     make_inverse_map,
@@ -51,9 +52,31 @@ from pandorica.stitch.contour_rotation import contour_rotation
 # Coarse pose robustness (image_only_poses): the two faces are different cut surfaces, so
 # ~half the block-match cells decorrelate; a confidence-weighted RANSAC fits the rigid
 # transform on the rest and we ABSTAIN when too few cells are inliers (also catches a bad
-# flip, which leaves few consistent cells). See tmp/coarse_warp/DISCOVERIES.md.
+# flip, which leaves few consistent cells).
 _GATE_FRAC = 0.12   # min rigid-inlier fraction to trust the block-match pose
 _MIN_CELLS = 12     # and at least this many correspondences, for a stable fit
+
+# Anisotropic/shear refine (image_only_poses): once the angle is locked, a small-window
+# block-match + affine RANSAC recovers a per-interface (sx, sy)/shear the rigid fit cannot.
+# On real EM faces:
+# the fit returns ~identity on isotropic data (0.07% spurious aniso over a 10-section
+# chain) and recovers a planted aniso to <0.5% with a small window; a large window biases
+# the magnitude ~+5pp (within-window deformation). So we use a SMALL window here and commit
+# the affine only when the residual stretch clears a gate (else keep the validated rigid).
+_AFFINE_HALF = 20      # small match window: minimises within-window-deformation aniso bias
+_ANISO_GATE = 0.02     # commit aniso/shear only if max(sx,sy)/min(sx,sy)-1 exceeds this
+
+# Physical guard on the committed residual-affine. _ANISO_GATE bounds the anisotropy
+# RATIO but NOT the absolute AREA, so the affine RANSAC can overfit a both-axes stretch
+# two adjacent EM sections cannot physically show (Monopoles sec12->sec13: det 1.12, an
+# 8.9%/3.1% stretch) — left in, it warps the volume corner by thousands of Å. We clamp
+# A_res's singular values and determinant into a physical band (keeping its orientation),
+# so a gross stretch is reined to a physical one. The band's low end must clear the
+# largest *real* compression in the stack (Monopoles sec10->sec11 sv 0.917, det 0.937 —
+# a genuine aniso that HELPS the MTs), so it only bites the overfit outlier. The MT
+# scale-gate (gate_coarse_scale) does the precise per-interface validation on top.
+_AFFINE_SV_BAND = (0.85, 1.15)    # per-axis stretch magnitude rail (gross single-axis)
+_AFFINE_DET_BAND = (0.90, 1.10)   # area change |det(A_res)| (the both-axes inflation)
 
 # Rotation = the angle with the most weighted RANSAC inlier SUPPORT (not a central-disk
 # NCC peak), which resolves the 180° branch by image consensus: a wrong flip leaves few
@@ -67,7 +90,7 @@ _ROT_TOL = 10.0       # sweep-chosen vs contour angle gap (deg) above this = dis
 # MT<->image dual-chain cross-check (reconcile_image_mt): the image RANSAC pose is an
 # independent second estimate; keep MT unless the image disagrees AND is more certain.
 # Translation override is GATED on the image's own confidence (silent on abstain) so the
-# cross-check stays low-noise. See tmp/coarse_warp/DISCOVERIES.md.
+# cross-check stays low-noise.
 _XCHK_SHIFT_FLOOR_PX = 8.0   # min |Δcenter-shift| (face px) to call a translation conflict
 _XCHK_SHIFT_FRAC = 0.25      # ...or this fraction of the drift magnitude (whichever larger)
 _XCHK_MT_MATCH_MIN = 0.30    # MT match-fraction below this = MT translation not trusted
@@ -178,7 +201,8 @@ def _ransac_rigid(
     return theta, t, best_inl, float(conf[best_inl].sum())
 
 
-def _match_rigid(fixed, moving, ang, center, *, metric, grid, search, tol, workers):
+def _match_rigid(fixed, moving, ang, center, *, metric, grid, search, tol, workers,
+                 half=64):
     """Rotate ``moving`` by ``ang``, block-match, then weighted-RANSAC a rigid refine.
 
     The block-match gives cell correspondences each with a confidence (peakiness);
@@ -196,7 +220,7 @@ def _match_rigid(fixed, moving, ang, center, *, metric, grid, search, tol, worke
     moving_rot = _rotate_face(moving, ang, center)
     src, dst, conf = block_match(
         fixed, moving_rot, None, method=metric, grid=grid,
-        search=search, workers=workers,
+        half=half, search=search, workers=workers,
     )
     ncell = len(src)
     dtheta, t, inl, support = _ransac_rigid(src, dst, conf, tol=tol)
@@ -206,11 +230,132 @@ def _match_rigid(fixed, moving, ang, center, *, metric, grid, search, tol, worke
     shift = np.array([[c, -sn], [sn, c]]) @ center + t - center
     return dict(
         rot=float(ang + np.degrees(dtheta)),
+        ang=float(ang),
         shift=np.asarray(shift, float),
         agree=float(agree),
         ncell=int(ncell),
         support=float(support),
     )
+
+
+def _fit_affine(src: np.ndarray, dst: np.ndarray, w: Optional[np.ndarray] = None):
+    """Weighted least-squares full 2-D affine fit ``dst ≈ A·src + t`` (A is 2x2).
+
+    Solved per output axis (the x- and y-equations decouple): each is a weighted
+    linear fit of ``[src_x, src_y, 1]`` to the target coordinate. Unlike the rigid
+    :func:`_rigid_from_pairs` this leaves the 2x2 free, so anisotropy and shear are
+    captured. :return: ``(A, t)``.
+    """
+    src = np.asarray(src, float)
+    dst = np.asarray(dst, float)
+    n = len(src)
+    w = np.ones(n) if w is None else np.asarray(w, float)
+    sw = np.sqrt(np.clip(w, 0.0, None))
+    M = np.column_stack([src[:, 0], src[:, 1], np.ones(n)]) * sw[:, None]
+    cx, *_ = np.linalg.lstsq(M, dst[:, 0] * sw, rcond=None)
+    cy, *_ = np.linalg.lstsq(M, dst[:, 1] * sw, rcond=None)
+    return np.array([[cx[0], cx[1]], [cy[0], cy[1]]]), np.array([cx[2], cy[2]])
+
+
+def _ransac_affine(
+    src: np.ndarray, dst: np.ndarray, conf: np.ndarray,
+    *, tol: float, iters: int = 300, seed: int = 0,
+):
+    """Confidence-weighted RANSAC full-affine fit (minimal sample = 3 pairs).
+
+    A 2-D affine is fixed by **three** correspondences, so the minimal sample is 3
+    (drawn ∝ ``conf``; near-collinear triples are skipped as degenerate). The model
+    with the largest confidence-weighted inlier support wins, then a weighted refit on
+    that inlier set. Affine inliers (not the rigid ones) are required because under real
+    anisotropy a rigid model only agrees near the centre, biasing the fit inward.
+
+    :return: ``(A, t, inlier_mask, support)`` — ``support`` = Σ conf over inliers.
+    """
+    src = np.asarray(src, float)
+    dst = np.asarray(dst, float)
+    conf = np.asarray(conf, float)
+    n = len(src)
+    if n < 3:
+        return np.eye(2), np.zeros(2), np.zeros(n, bool), 0.0
+    p = conf / conf.sum() if conf.sum() > 0 else None
+    rng = np.random.default_rng(seed)
+    best_support, best_inl = -1.0, None
+    for _ in range(int(iters)):
+        idx = rng.choice(n, size=3, replace=False, p=p)
+        d1, d2 = src[idx[1]] - src[idx[0]], src[idx[2]] - src[idx[0]]
+        if abs(d1[0] * d2[1] - d1[1] * d2[0]) < 1.0:
+            continue  # near-collinear triple -> degenerate affine
+        A, t = _fit_affine(src[idx], dst[idx])
+        if not np.isfinite(A).all():
+            continue
+        inl = np.linalg.norm(src @ A.T + t - dst, axis=1) < tol
+        support = float(conf[inl].sum())
+        if support > best_support:
+            best_support, best_inl = support, inl
+    if best_inl is None or int(best_inl.sum()) < 3:
+        return np.eye(2), np.zeros(2), np.zeros(n, bool), 0.0
+    A, t = _fit_affine(src[best_inl], dst[best_inl], conf[best_inl])
+    return A, t, best_inl, float(conf[best_inl].sum())
+
+
+def _clamp_affine(A: np.ndarray):
+    """Bound a residual-affine into a physical stretch/area band, keeping orientation.
+
+    SVD ``A = U·diag(s)·Vt``; clamp each singular value into :data:`_AFFINE_SV_BAND`
+    (per-axis stretch rail), then clamp ``det`` into :data:`_AFFINE_DET_BAND` by an
+    isotropic rescale — which leaves the anisotropy *direction and ratio* intact while
+    reining the absolute AREA the ratio-only :data:`_ANISO_GATE` never bounded. So a
+    genuine mild aniso passes through unchanged and only a gross over-stretch is pulled
+    back to the physical edge. :return: ``(A_clamped, changed)``.
+    """
+    U, s, Vt = np.linalg.svd(A)
+    s_c = np.clip(s, _AFFINE_SV_BAND[0], _AFFINE_SV_BAND[1])
+    A_c = (U * s_c) @ Vt
+    det = float(np.linalg.det(A_c))
+    lo, hi = _AFFINE_DET_BAND
+    if det > 0 and (det < lo or det > hi):
+        A_c = A_c * float(np.sqrt(np.clip(det, lo, hi) / det))
+    return A_c, not np.allclose(A_c, A, atol=1e-6)
+
+
+def _affine_refine(fixed, moving, ang, center, *, metric, grid, search, workers,
+                   half=_AFFINE_HALF):
+    """Recover a per-interface anisotropic/shear linear part once the angle is locked.
+
+    Mirrors :func:`_match_rigid` at the committed sweep angle ``ang`` — rotate ``moving``
+    by ``ang`` about ``center``, block-match (but with the SMALL :data:`_AFFINE_HALF`
+    window, which minimises the within-window-deformation bias on the aniso magnitude),
+    confidence-weighted affine-RANSAC — then builds the rel pose's linear part exactly
+    like production's rigid formula with the residual rigid ``R(dtheta)`` replaced by the
+    residual affine ``A_res``::
+
+        L = A_res · R(ang)            (rigid limit A_res = R(dtheta) ⇒ L = R(ang+dtheta))
+        shift = A_res·center + t − center
+
+    On a rigid interface ``A_res ≈ I`` and this reproduces the rigid pose to <0.3 px.
+    :return: ``(L, shift_px, (sx, sy), n_inl)``
+    — ``(sx, sy)`` = singular values of ``A_res`` (residual stretch magnitudes), or
+    ``None`` when too few correspondences for a stable affine.
+    """
+    moving_rot = _rotate_face(moving, ang, center)
+    src, dst, conf = block_match(
+        fixed, moving_rot, None, method=metric, grid=grid,
+        half=half, search=search, workers=workers,
+    )
+    if len(src) < _MIN_CELLS:
+        return None
+    tol = max(6.0, search / 8.0)
+    A, t, inl, _support = _ransac_affine(src, dst, conf, tol=tol)
+    if int(inl.sum()) < _MIN_CELLS:
+        return None
+    A, _ = _clamp_affine(A)  # physical guard: rein a non-physical over-stretch / area
+    a = np.deg2rad(ang)
+    R = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
+    center = np.asarray(center, float)
+    L = A @ R
+    shift = A @ center + t - center
+    s = np.linalg.svd(A, compute_uv=False)
+    return L, np.asarray(shift, float), (float(s.min()), float(s.max())), int(inl.sum())
 
 
 def _angle_gap(a: float, b: float) -> float:
@@ -229,7 +374,7 @@ def _agree_rotation(fixed, moving, center, *, mk, step: float = _SWEEP_STEP):
     cells consistent with one rigid transform): a few confident, geometrically consistent
     landmarks beat a spray of low-information cells, and a wrong 180° flip loses because
     it leaves few consistent pairs. The ranking pass is ~10× cheaper per angle — full
-    grid × every swept angle was the cost of this stage (see tmp/coarse_warp).
+    grid × every swept angle was the cost of this stage.
 
     :return: ``(win, opp)`` — branch records ``dict(rot, shift, agree, ncell, support)``;
         ``win`` = best angle, ``opp`` = best angle in the OPPOSITE (>90°) branch (``None``
@@ -245,7 +390,7 @@ def _agree_rotation(fixed, moving, center, *, mk, step: float = _SWEEP_STEP):
     center_c = np.asarray(center, float) / ds_c
     mk_c = dict(
         mk, grid=max(4, int(mk["grid"]) // 2),
-        search=search_c, tol=max(6.0, float(mk["tol"]) / 2.0),
+        search=search_c, tol=max(6.0, float(mk["tol"]) / 2.0), half=64,
     )
     coarse = {
         round(float(a), 3): _match_rigid(fx_c, mv_c, a, center_c, **mk_c)["support"]
@@ -384,7 +529,11 @@ def image_only_poses(
         ``flagged``, ``tag``, ``rot_geom`` = the contour cross-check angle, or
         ``None`` when the nucleus can't be segmented; ``support`` = committed-branch
         weighted RANSAC inlier support, ``branch_ambiguous`` = the 180° branches tied,
-        ``opp_rot`` = opposite-branch angle deg or ``None``, ``pxf`` = Å per face pixel).
+        ``opp_rot`` = opposite-branch angle deg or ``None``, ``pxf`` = Å per face pixel;
+        ``sx``, ``sy`` = the residual-affine singular values (in-plane stretch
+        magnitudes; ``(1, 1)`` when the angle abstained or the affine refine failed),
+        ``aniso_committed`` = whether that ``(sx, sy)``/shear was actually committed
+        into the pose, i.e. it cleared :data:`_ANISO_GATE`).
         Pure side-channel for diagnostics/visualisation and the MT cross-check
         (:func:`reconcile_image_mt`) — it does not affect the returned poses. ``None``
         (default) disables it.
@@ -417,13 +566,22 @@ def image_only_poses(
         # too-small window was what made the old plain-median shift return noise.
         search = match_search or int(np.clip(min(hf, wf) // 8, 64, 256))
         tol = max(12.0, search / 6.0)  # scales with search -> noise floor stays ~2%
-        mk = dict(metric=metric, grid=match_grid, search=search, tol=tol, workers=workers)
+        # Block-match window scaled to the face so each translation cell sees a
+        # CONSTANT physical area across load_downscale: a fixed 64 px half covered only
+        # ~half the structure at a 2048 px (ds=2) face vs a 1024 px (ds=4) one, halving
+        # the RANSAC inlier agreement and destabilising the translation (agree
+        # 0.16 -> 0.3 at a 2048 px face). The 64 floor leaves <=1024 px faces (the
+        # validated ds=4 size, and every unit-test face) byte-for-byte unchanged.
+        match_half = max(64, min(hf, wf) // 16)
+        mk = dict(metric=metric, grid=match_grid, search=search, tol=tol,
+                  workers=workers, half=match_half)
 
         # Rotation = angle with most weighted RANSAC support (see _agree_rotation);
         # contour_rotation runs as an independent geometry cross-check (review flag only).
         est = contour_rotation(fixed_mean, moving_mean)
         win, opp = _agree_rotation(fixed, moving, center, mk=mk)
         rot, shift, agree, ncell = win["rot"], win["shift"], win["agree"], win["ncell"]
+        committed_ang = win["ang"]  # sweep angle of the committed branch (for affine refine)
         rot_geom = est.angle if est is not None else None  # contour cross-check (diagnostics)
         win_count = win["support"]
         opp_count = opp["support"] if opp is not None else 0.0
@@ -440,6 +598,7 @@ def image_only_poses(
                 rot, shift, agree, ncell = (
                     opp["rot"], opp["shift"], opp["agree"], opp["ncell"]
                 )
+                committed_ang = opp["ang"]
                 win_count, opp_count = opp_count, win_count
 
         trans_ok = ncell >= _MIN_CELLS and agree >= min_inlier_frac
@@ -459,16 +618,44 @@ def image_only_poses(
         if is_flagged or not trans_ok:
             flagged.append(label)
 
+        # Default to the validated rigid pose. Then, with the angle locked, fit a
+        # small-window affine on its own RANSAC inliers and COMMIT the (sx, sy)/shear it
+        # finds — but only when the residual stretch clears _ANISO_GATE (isotropic serial
+        # sections fit ~identity, so this is a no-op there; see the probe constants above).
+        sx = sy = 1.0
+        aniso_committed = False
         rel = geo.centroid_pose(
             rot, float(shift[0]) * pxf, float(shift[1]) * pxf, center * pxf
         )
+        if trans_ok:
+            # The affine window AND cell grid scale with the face so each cell covers a
+            # CONSTANT physical area and the cell DENSITY is constant across
+            # load_downscale: the validated (_AFFINE_HALF, match_grid) config is for a
+            # ~1024 px face (ds=4); at 2048 px (ds=2) a 20 px window over a 12-cell grid
+            # returned too few affine inliers to recover the stretch at all.
+            # Floors keep <=1024 px faces (ds=4, unit tests) unchanged.
+            aff_scale = min(fixed.shape) / 1024.0
+            aff_half = max(_AFFINE_HALF, round(_AFFINE_HALF * aff_scale))
+            aff_grid = max(match_grid, round(match_grid * aff_scale))
+            ref = _affine_refine(fixed, moving, committed_ang, center,
+                                 metric=metric, grid=aff_grid, half=aff_half,
+                                 search=search, workers=workers)
+            if ref is not None:
+                L, shift_aff, (sx, sy), n_aff = ref
+                stretch = max(sx, sy) / max(min(sx, sy), 1e-9) - 1.0
+                if stretch > _ANISO_GATE and n_aff >= _MIN_CELLS:
+                    c_phys = center * pxf
+                    t_rel = c_phys - L @ c_phys + shift_aff * pxf
+                    rel = pose_from_matrix(L, t_rel)
+                    aniso_committed = True
         poses.append(compose_poses(poses[-1], rel))
         reasons = [r for r, bad in (("sign", is_flagged), ("shift", not trans_ok)) if bad]
         review = f"  NEEDS REVIEW ({'+'.join(reasons)})" if reasons else ""
+        aniso_note = f"  aniso=({sx:.3f},{sy:.3f})" if aniso_committed else ""
         log(
             f"  [image-pose] {label}: rot={rot:+.1f}°  "
             f"shift=({shift[0]:+.0f},{shift[1]:+.0f})px  "
-            f"matches={ncell} agree={agree:.0%}  [{tag}]{review}"
+            f"matches={ncell} agree={agree:.0%}{aniso_note}  [{tag}]{review}"
         )
         if on_interface is not None:
             on_interface(dict(
@@ -478,7 +665,8 @@ def image_only_poses(
                 rot_geom=rot_geom, support=float(win_count),
                 branch_ambiguous=bool(branch_ambiguous),
                 opp_rot=(float(opp["rot"]) if opp is not None else None),
-                pxf=float(pxf),
+                pxf=float(pxf), sx=float(sx), sy=float(sy),
+                aniso_committed=bool(aniso_committed),
             ))
 
         dataset.sections[k].drop_volume()

@@ -55,6 +55,24 @@ def _vmf_direction_cost(d1: np.ndarray, d2: np.ndarray) -> float:
     return 1.0 - abs(cos_a)
 
 
+def _signed_inplane_cos(d1: np.ndarray, d2: np.ndarray, min_xy: float):
+    """Signed in-plane tangent cosine, or ``None`` when either side is near-vertical.
+
+    Unlike :func:`_vmf_direction_cost` this keeps the SIGN, so an anti-parallel
+    (fold-back) pair reads negative. ``extract_boundary_endpoints`` orients every
+    tangent +Z-ward (``seg[-1] - seg[0]`` in ascending-Z order on both faces), so a
+    real fiber continuing across the gap has a POSITIVE in-plane cosine; a negative
+    one is a fold-back — two different MTs the matcher should not pair. Returns
+    ``None`` when either in-plane tangent is shorter than ``min_xy`` (near-vertical:
+    the in-plane direction is noise and gives no reliable sign).
+    """
+    a, b = d1[:2], d2[:2]
+    na, nb = np.linalg.norm(a), np.linalg.norm(b)
+    if na < min_xy or nb < min_xy:
+        return None
+    return float(np.clip(np.dot(a, b) / (na * nb), -1.0, 1.0))
+
+
 def dedupe_endpoints(
     endpoints: List[Dict], rho: float, dup_frac: float = 0.1
 ) -> List[Dict]:
@@ -97,24 +115,35 @@ def _resolve_max_dist(
     return float(np.clip(max_dist_rho * rho, min_dist_A, max_dist_A))
 
 
-def _cost_matrix(ref, mov, rho, max_dist, max_angle_deg, w_dist):
-    """Pairwise cost; np.inf where the distance/angle hard gates are exceeded.
+def _cost_matrix(ref, mov, rho, max_dist, max_angle_deg, w_dist,
+                 sign_min_xy=0.2, sign_min_cos=0.0):
+    """Pairwise cost; np.inf where the distance/angle/orientation gates are exceeded.
 
     ``max_dist`` is in the same units as the endpoint positions (Å in the
     pipeline). Resolve it via :func:`_resolve_max_dist` before calling.
+
+    The ``max_angle_deg`` gate is sign-agnostic (``|cos|``), so it accepts a
+    fold-back (anti-parallel) pair as "aligned". A continuous fiber does not reverse
+    direction across the gap, so the additional ORIENTATION gate rejects pairs whose
+    signed in-plane cosine is below ``sign_min_cos`` when both tangents are reliable
+    (in-plane magnitude ≥ ``sign_min_xy``). Near-vertical pairs (unreliable in-plane
+    sign) are exempt. Set ``sign_min_cos`` very negative to disable.
     """
     n_ref, n_mov = len(ref), len(mov)
     cost = np.full((n_ref, n_mov), np.inf)
     if max_dist <= 0.0:
         return cost
+    angle_gate = 1.0 - np.cos(np.deg2rad(max_angle_deg))
     for i, r in enumerate(ref):
         for j, m in enumerate(mov):
             d = np.linalg.norm(r["pos"][:2] - m["pos"][:2])
             if d > max_dist:
                 continue
             dir_cost = _vmf_direction_cost(r["dir"], m["dir"])
-            # |cos Δθ| <= cos(max_angle) ⇔ dir_cost >= 1 - cos(max_angle)
-            if dir_cost > 1.0 - np.cos(np.deg2rad(max_angle_deg)):
+            if dir_cost > angle_gate:  # |cos Δθ| <= cos(max_angle)
+                continue
+            sc = _signed_inplane_cos(r["dir"], m["dir"], sign_min_xy)
+            if sc is not None and sc < sign_min_cos:  # reliable fold-back: reject
                 continue
             cost[i, j] = w_dist * (d / max_dist) + (1.0 - w_dist) * dir_cost
     return cost
@@ -160,23 +189,32 @@ def _pair_direction_cost(r_dir, m_dir) -> float:
     return _vmf_direction_cost(np.asarray(r_dir), np.asarray(m_dir))
 
 
-def uncross_pairs(matches, ref, mov, rho, neighbour_rho=2.0):
+def uncross_pairs(matches, ref, mov, rho, neighbour_rho=2.0, dir_veto_margin=0.2):
     """
-    Locally uncross X-crossed Hungarian pairs by direction continuity.
+    Locally uncross X-crossed Hungarian pairs, geometry-first.
 
-    Hungarian minimises *total* cost; near-coincident pairs with similar
-    direction can come out crossed (A↔B', B↔A') because the swap raises the
-    sum elsewhere. This pass examines each pair against close neighbours
-    (within ``neighbour_rho * rho``), checks whether their connecting segments
-    cross in XY, and if so evaluates the swap: the configuration with lower
-    *direction-only* cost wins. Distance is intentionally excluded — that was
-    Hungarian's tiebreaker and is what gets fooled in the rung-swap case.
+    Hungarian minimises *total* cost; near-coincident pairs can come out crossed
+    (A↔B', B↔A') because the swap raises the sum elsewhere. This pass examines each
+    pair against close neighbours (within ``neighbour_rho * rho``), checks whether
+    their connecting segments cross in XY, and if so **uncrosses by default** — a
+    detected X-cross is the rung-swap pathology unless the matched tangents *clearly*
+    prefer the crossed pairing. The earlier version swapped only when the
+    direction-only cost strictly improved, which never fired for the common case of
+    **parallel** stubs (direction can't tell crossed from uncrossed), so those
+    crossings survived to be discarded downstream. We now swap whenever the swap's
+    direction cost is within ``dir_veto_margin`` of the current — i.e. uncross unless
+    direction *vetoes* it (a genuine crossing, where the crossed pairing is clearly
+    better by tangent). Distance is still not used as the score (it was Hungarian's
+    fooled tiebreaker); the geometry signal is the *crossing itself*.
 
     :param matches: list of ``(ref_idx, mov_idx, cost)`` from Hungarian, indexing
         the deduped endpoint lists ``ref`` / ``mov``.
     :param ref / mov: deduped endpoint lists (each entry has ``pos`` and ``dir``).
     :param rho: median endpoint NN spacing.
     :param neighbour_rho: search radius in ρ for cross checks.
+    :param dir_veto_margin: how much *worse* (in direction cost) the uncrossed
+        pairing may be and still be taken. ``0`` reproduces the old strict rule;
+        larger uncrosses parallel rung-swaps that direction alone cannot resolve.
     :return: an uncrossed match list (same length, indices possibly reassigned).
     """
     if len(matches) < 2:
@@ -215,7 +253,9 @@ def uncross_pairs(matches, ref, mov, rho, neighbour_rho=2.0):
                 swp = _pair_direction_cost(
                     ref[ri]["dir"], mov[mj]["dir"]
                 ) + _pair_direction_cost(ref[rj]["dir"], mov[mi]["dir"])
-                if swp + 1e-9 < cur:
+                # Uncross by default: take the swap unless the tangents clearly
+                # prefer staying crossed (a genuine crossing) by > dir_veto_margin.
+                if swp < cur + dir_veto_margin:
                     out[i][1], out[j][1] = mj, mi
                     # Costs become stale after swap — recompute from the
                     # matcher's full distance + direction metric so callers
@@ -382,9 +422,12 @@ def match_sections(
     max_dist_A: float = 2500.0,
     max_angle_deg: float = 30.0,
     w_dist: float = 0.7,
+    sign_min_xy: float = 0.2,
+    sign_min_cos: float = 0.0,
     dup_frac: float = 0.1,
     max_resid_rho: float = 2.0,
     uncross_neighbour_rho: float = 2.0,
+    uncross_dir_veto_margin: float = 0.2,
     smoothness_max_tangent_deg: float = 45.0,
     smoothness_max_chord_tangent_deg: float = 60.0,
     smoothness_chord_check_rho: float = 1.0,
@@ -421,9 +464,16 @@ def match_sections(
         should land within this even if warp residual is sizeable.
     :param max_angle_deg: max tangent angle difference (sign-agnostic).
     :param w_dist: weight of the distance term vs the direction term.
+    :param sign_min_xy: minimum in-plane tangent magnitude (both sides) for the
+        orientation gate to apply — near-vertical stubs have no reliable in-plane sign.
+    :param sign_min_cos: reject a pair whose signed in-plane cosine is below this
+        (a fold-back: anti-parallel tangents, two different MTs). ``0`` rejects the
+        anti-parallel half; set very negative to disable the orientation gate.
     :param dup_frac: dedupe radius as a fraction of ρ.
     :param max_resid_rho: outlier residual gate, in ρ.
     :param uncross_neighbour_rho: local radius (ρ) for the X-cross check.
+    :param uncross_dir_veto_margin: uncross a detected X-cross unless the tangents
+        prefer the crossed pairing by more than this (resolves parallel rung-swaps).
     :param smoothness_max_tangent_deg: per-pair tangent-vs-tangent gate (deg).
     :param smoothness_max_chord_tangent_deg: per-pair chord-vs-tangent gate
         (deg). Higher = more MT curvature allowed across the cut. The default
@@ -446,12 +496,14 @@ def match_sections(
         return [], *empty, _confidence(*empty, [], len(ref), len(mov), rho), []
 
     max_dist = _resolve_max_dist(rho, max_dist_rho, min_dist_A, max_dist_A)
-    cost = _cost_matrix(ref, mov, rho, max_dist, max_angle_deg, w_dist)
+    cost = _cost_matrix(ref, mov, rho, max_dist, max_angle_deg, w_dist,
+                        sign_min_xy=sign_min_xy, sign_min_cos=sign_min_cos)
     matches = _assign(cost)
     if not matches:
         return [], *empty, _confidence(*empty, [], len(ref), len(mov), rho), []
 
-    matches = uncross_pairs(matches, ref, mov, rho, neighbour_rho=uncross_neighbour_rho)
+    matches = uncross_pairs(matches, ref, mov, rho, neighbour_rho=uncross_neighbour_rho,
+                            dir_veto_margin=uncross_dir_veto_margin)
     matches = filter_pair_smoothness(
         matches,
         ref,
