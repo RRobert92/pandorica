@@ -11,10 +11,14 @@ electron tomograms into one volume with a merged microtubule (MT) network.
 > plain-language tour of the pipeline, no math required. This README is the
 > dense reference.
 
-The pipeline is **MT-graph-driven**: it aligns sections by matching the
-microtubule endpoints that cross each section-to-section gap, with an image-only
-fallback when graphs are absent. It is self-contained (no napari / Qt) and runs
-headless on a workstation, a Mac (MPS), or a CUDA box.
+The pipeline is **image-driven coarse→fine** when section volumes are present (the
+common case): the **image** fixes each section's global pose — rotation, shift, and
+anisotropic (knife-compression) stretch — and that one pose is applied to both the
+volume and the microtubules; the **microtubules** then drive only the *fine residual
+warp* on top of it. With only graphs (no volumes) it falls back to an **MT-pose
+solve** (coarse MT-endpoint rotation search → relative rigid fits → global pose
+solve). It is self-contained (no napari / Qt) and runs headless on a workstation, a
+Mac (MPS), or a CUDA box.
 
 ```python
 from pandorica.stitch.cli import run_stitch
@@ -37,8 +41,12 @@ run_stitch("path/to/sections")          # writes <dir>/stitched_output/
 
 ## Method
 
-End to end, for a stack of *n* sections (`pipeline/stitcher.py` →
-`pipeline/core.py`):
+Two coarse modes share the same fine-warp + QC machinery: **(a) image-coarse →
+MT-fine** (default with volumes — the image coarse of step 7 is the *primary* pose
+source and the MTs fit only the residual warp of step 5; the MT pose-solve of steps
+1 & 4 does **not** run), and **(b) MT-pose solve** (the no-volume fallback — steps
+1–4). Steps 2, 3, 6, 8 are shared. End to end, for a stack of *n* sections
+(`pipeline/stitcher.py` → `pipeline/core.py`):
 
 1. **Coarse rotation (per interface).** A *global* MT-endpoint rotation search
    sweeps θ ∈ [0, 360°) and takes the angle maximising the matched fraction,
@@ -142,13 +150,49 @@ End to end, for a stack of *n* sections (`pipeline/stitcher.py` →
    kwargs for reproduction)` block of `stitch_log.txt` records the values
    actually used, so a re-run with the same flags is exact.
 
+## Coarse→fine specifics (the image-coarse default)
+
+When volumes are present the global pose is the **image coarse** and the MTs add only
+the residual; a few behaviours are specific to that path:
+
+* **Anisotropic stretch in the global pose.** The image coarse commits a per-axis
+  `(sx, sy)` stretch (knife compression), not just a similarity — carried as an
+  L-matrix through the global solve to the final per-section poses (`image_pose.py`,
+  `transform/solver.py`). The per-section log prints one `scale = √det L`, which
+  *summarises* the L-matrix; it does not flatten the anisotropy.
+* **MT rotation rescue + anisotropy recovery.** On an interface where the image coarse
+  rotation fails (the MT match collapses below the gate — e.g. a near-circular
+  MT-bundle face with no nuclear contour to cross-check), the dense MTs re-estimate the
+  rotation and, from the bootstrapped correspondences, the residual `(sx, sy)` — adopted
+  only when it clearly beats the image's match (`rescue_coarse_poses`,
+  `_rescue_relative`). A symmetric **scale-gate** drops an image stretch the MTs reject
+  (rotation-only matches better), so neither can make an interface worse
+  (`gate_coarse_scale`). Only the rescued/gated interfaces are re-warped — the rest are
+  reused from the first pass, since their relative pose is invariant to the correction.
+* **Chaining is decoupled from the warp.** Whether two sections are *connected* (their
+  MT networks linked) is judged on **match quality** (`InterfaceQC.chainable`: coherent
+  matches above the fraction gate), independent of whether the pixel warp passed its
+  diffeomorphism gate. A too-twisty warp is rejected (that gap keeps the coarse
+  alignment) without blocking a clean connection.
+* **Gentle warp shaping.** The fine warp adds an optional **tangent-continuity** term
+  (`warp_tangent_weight`) that nudges matched shallow-MT stubs to continue smoothly
+  across the seam (minimises "stairs"), staying subordinate to the diffeomorphism
+  guard; and a **near-vertical jog cut** (`cut_vertical_jog_rho`) that drops a
+  split-blind near-vertical pair whose residual displacement is a local outlier (a
+  wrong join the direction-based split cannot judge).
+
+**Inspecting a run.** `run_stitch(..., save_inspect=True)` (CLI `--save-inspect`) writes
+`stitch_inspect.npz` — per-interface MT match lines, the warp field, `|curl|`, and QC —
+which the napari **Warp / Match Inspector** overlays without re-running the stitch.
+
 ## Module map
 
 ```
 cli              headless run_stitch orchestration + reporting
 io               dataset discovery / loading (Dataset, load_dataset)
 stitch           result accessors + stitched-output export
-image_pose       image-only coarse poses (no-MT fallback)
+inspect          per-interface match + warp bundle for the napari inspector (--save-inspect)
+image_pose       image-coarse poses (primary with volumes; sole pose source with no MTs)
 contour_rotation image-only rotation cross-check (nuclear contour + organelle constellation)
 image_warp       image-fill residual warps for MT-free regions
 geometry         pose <-> pixel math, boundary landmarks

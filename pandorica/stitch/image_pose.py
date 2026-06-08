@@ -52,13 +52,13 @@ from pandorica.stitch.contour_rotation import contour_rotation
 # Coarse pose robustness (image_only_poses): the two faces are different cut surfaces, so
 # ~half the block-match cells decorrelate; a confidence-weighted RANSAC fits the rigid
 # transform on the rest and we ABSTAIN when too few cells are inliers (also catches a bad
-# flip, which leaves few consistent cells). See tmp/coarse_warp/DISCOVERIES.md.
+# flip, which leaves few consistent cells).
 _GATE_FRAC = 0.12   # min rigid-inlier fraction to trust the block-match pose
 _MIN_CELLS = 12     # and at least this many correspondences, for a stable fit
 
 # Anisotropic/shear refine (image_only_poses): once the angle is locked, a small-window
 # block-match + affine RANSAC recovers a per-interface (sx, sy)/shear the rigid fit cannot.
-# Probe (tmp/aniso_policy_probe.py, tmp/verify_affine_refine.py) on a real EM face:
+# On real EM faces:
 # the fit returns ~identity on isotropic data (0.07% spurious aniso over a 10-section
 # chain) and recovers a planted aniso to <0.5% with a small window; a large window biases
 # the magnitude ~+5pp (within-window deformation). So we use a SMALL window here and commit
@@ -90,7 +90,7 @@ _ROT_TOL = 10.0       # sweep-chosen vs contour angle gap (deg) above this = dis
 # MT<->image dual-chain cross-check (reconcile_image_mt): the image RANSAC pose is an
 # independent second estimate; keep MT unless the image disagrees AND is more certain.
 # Translation override is GATED on the image's own confidence (silent on abstain) so the
-# cross-check stays low-noise. See tmp/coarse_warp/DISCOVERIES.md.
+# cross-check stays low-noise.
 _XCHK_SHIFT_FLOOR_PX = 8.0   # min |Δcenter-shift| (face px) to call a translation conflict
 _XCHK_SHIFT_FRAC = 0.25      # ...or this fraction of the drift magnitude (whichever larger)
 _XCHK_MT_MATCH_MIN = 0.30    # MT match-fraction below this = MT translation not trusted
@@ -332,8 +332,8 @@ def _affine_refine(fixed, moving, ang, center, *, metric, grid, search, workers,
         L = A_res · R(ang)            (rigid limit A_res = R(dtheta) ⇒ L = R(ang+dtheta))
         shift = A_res·center + t − center
 
-    On a rigid interface ``A_res ≈ I`` and this reproduces the rigid pose to <0.3 px
-    (validated, tmp/verify_affine_refine.py). :return: ``(L, shift_px, (sx, sy), n_inl)``
+    On a rigid interface ``A_res ≈ I`` and this reproduces the rigid pose to <0.3 px.
+    :return: ``(L, shift_px, (sx, sy), n_inl)``
     — ``(sx, sy)`` = singular values of ``A_res`` (residual stretch magnitudes), or
     ``None`` when too few correspondences for a stable affine.
     """
@@ -374,7 +374,7 @@ def _agree_rotation(fixed, moving, center, *, mk, step: float = _SWEEP_STEP):
     cells consistent with one rigid transform): a few confident, geometrically consistent
     landmarks beat a spray of low-information cells, and a wrong 180° flip loses because
     it leaves few consistent pairs. The ranking pass is ~10× cheaper per angle — full
-    grid × every swept angle was the cost of this stage (see tmp/coarse_warp).
+    grid × every swept angle was the cost of this stage.
 
     :return: ``(win, opp)`` — branch records ``dict(rot, shift, agree, ncell, support)``;
         ``win`` = best angle, ``opp`` = best angle in the OPPOSITE (>90°) branch (``None``
@@ -569,8 +569,8 @@ def image_only_poses(
         # Block-match window scaled to the face so each translation cell sees a
         # CONSTANT physical area across load_downscale: a fixed 64 px half covered only
         # ~half the structure at a 2048 px (ds=2) face vs a 1024 px (ds=4) one, halving
-        # the RANSAC inlier agreement and destabilising the translation (tmp/diag_
-        # translation.py: agree 0.16 -> 0.3). The 64 floor leaves <=1024 px faces (the
+        # the RANSAC inlier agreement and destabilising the translation (agree
+        # 0.16 -> 0.3 at a 2048 px face). The 64 floor leaves <=1024 px faces (the
         # validated ds=4 size, and every unit-test face) byte-for-byte unchanged.
         match_half = max(64, min(hf, wf) // 16)
         mk = dict(metric=metric, grid=match_grid, search=search, tol=tol,
@@ -632,8 +632,8 @@ def image_only_poses(
             # CONSTANT physical area and the cell DENSITY is constant across
             # load_downscale: the validated (_AFFINE_HALF, match_grid) config is for a
             # ~1024 px face (ds=4); at 2048 px (ds=2) a 20 px window over a 12-cell grid
-            # returned too few affine inliers to recover the stretch at all (tmp/diag_
-            # aniso.py). Floors keep <=1024 px faces (ds=4, unit tests) unchanged.
+            # returned too few affine inliers to recover the stretch at all.
+            # Floors keep <=1024 px faces (ds=4, unit tests) unchanged.
             aff_scale = min(fixed.shape) / 1024.0
             aff_half = max(_AFFINE_HALF, round(_AFFINE_HALF * aff_scale))
             aff_grid = max(match_grid, round(match_grid * aff_scale))

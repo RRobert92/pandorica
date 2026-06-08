@@ -553,7 +553,7 @@ def register_warps_to_coarse(
 
     Crucially, **no rigid/affine is re-fit from the MT correspondences** — fitting
     one would force the spatially-varying field into a global transform and overfit
-    the anisotropy (the reverted MT-global-affine mistake). The committed relative
+    the anisotropy (MTs don't carry the global aniso — the image does). The committed relative
     pose IS the image coarse, so the absolute poses returned are exactly
     ``coarse_poses``; the matched moving MTs land in the reference frame through that
     pose and the warp captures their residual displacement onto the reference MTs.
@@ -840,6 +840,7 @@ def gate_coarse_scale(
     match_gate: float = 0.3,
     scale_margin: float = _SCALE_GATE_MARGIN,
     min_sv_dev: float = _SCALE_GATE_MIN_SV_DEV,
+    full_match_fractions=None,
     **match_kwargs,
 ):
     """Drop an interface's image-coarse scale where the dense MTs match clearly better
@@ -859,6 +860,10 @@ def gate_coarse_scale(
     :func:`rescue_coarse_poses` (which rescues a wrong rotation); the two target disjoint
     interfaces (rescue: match below gate; gate: rotation-only beats a committed scale).
 
+    :param full_match_fractions: optional per-interface ``match_fraction`` from the first
+        :func:`register_warps_to_coarse` pass, reused as the full-pose score (``None`` per
+        entry forces a fresh score — pass ``None`` for any rescued interface whose rel
+        changed). Saves one bootstrap registration per scored interface, exactly.
     :return: ``(poses, gated)`` — the corrected absolute pose chain (unchanged where
         nothing was gated) and a list of ``(k, det_before, full_match, rot_match)`` for
         logging.
@@ -884,8 +889,16 @@ def gate_coarse_scale(
         if len(mov_eps) < 3:
             continue
         rot_rel = _centroid_rotation_seed(float(rel["Angle"]), mov_eps)
-        m_full = _seed_match_fraction(
-            coords_list[k], coords_list[k + 1], rel, z_band_fraction, match_kwargs
+        # The "full pose" match under this interface's (unchanged) rel was already computed by
+        # the first register_warps_to_coarse pass — reuse it instead of re-registering. The
+        # caller passes None for any interface whose rel changed upstream (a rescue), forcing a
+        # fresh score there. Same number, ~half the gate's registrations.
+        m_full = (
+            full_match_fractions[k]
+            if full_match_fractions is not None and full_match_fractions[k] is not None
+            else _seed_match_fraction(
+                coords_list[k], coords_list[k + 1], rel, z_band_fraction, match_kwargs
+            )
         )
         m_rot = _seed_match_fraction(
             coords_list[k], coords_list[k + 1], rot_rel, z_band_fraction, match_kwargs

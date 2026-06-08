@@ -162,6 +162,14 @@ knife compression.
 microtubules too.** Both the image and the fibres now sit in the same
 roughly-aligned frame, so the fine stage can start from there.
 
+**When the image gets it wrong — the microtubules can rescue it.** On a hard
+interface (a near-round slice with no clear outline) the image can occasionally
+read the rotation badly wrong. The fibres are the safety net: when the matched
+fraction collapses — the tell-tale of a wrong coarse move — the tool re-estimates
+the rotation *and* the x/y stretch straight from the dense microtubule stubs, and
+adopts that only when it clearly matches better. So a single bad image reading
+does not sink the interface; the fibres correct it.
+
 ---
 
 ## Stage 2 — Fine: bend locally to undo the uneven shrink
@@ -253,6 +261,14 @@ with the reason, and the end-of-run log tells you exactly which joints are
 confident and which need a human look. This is the most important design
 choice of the whole tool: **it would rather flag uncertainty than silently
 produce a wrong stack.**
+
+**One subtlety worth knowing: connecting is judged separately from bending.**
+Whether two sections are *joined* (their microtubule networks linked) depends on
+whether the fibre stubs matched cleanly — not on whether the local bend passed.
+So if the stubs pair up well but the bend comes out too twisty to apply safely,
+the sections are still joined and that spot simply keeps the coarse alignment
+(no bend there). A rejected bend never blocks a good connection — and a clean
+connection never forces a bad bend onto the volume.
 
 A natural cross-check falls out of the design for free: if the coarse
 rotation were wrong, the microtubule stubs would not pair up in the fine

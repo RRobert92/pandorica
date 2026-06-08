@@ -184,19 +184,42 @@ def stitch_sections(
         # rotation rescue above never catches — such an interface still matches above the
         # gate, it just warps the volume corner. Runs on the (possibly rescued) chain;
         # the two passes target disjoint interfaces.
+        # Reuse the first pass's full-pose match for the scale-gate (the score it would
+        # otherwise re-register); force a fresh score on any rescued interface, whose rel
+        # changed so the first-pass match no longer describes it.
+        rescued_ks = {r[0] for r in rescues}
+        reused_full_mf = [
+            None if k in rescued_ks
+            else base.interfaces[k].confidence.get("match_fraction")
+            for k in range(len(base.interfaces))
+        ]
         coarse_poses, scale_gates = gate_coarse_scale(
             coords_list, list(coarse_poses),
             z_band_fraction=z_band_fraction, match_gate=qc_min_match_fraction,
+            full_match_fractions=reused_full_mf,
             **match_kwargs,
         )
         if rescues or scale_gates:
-            base = register_warps_to_coarse(
-                coords_list, coarse_poses,
-                progress=(
-                    (lambda k, ntot: progress("rescue-warp", k, ntot))
-                    if progress else None
-                ),
-                **warp_kw, **match_kwargs,
+            # Only the rescued/gated interfaces changed their relative pose; every other
+            # interface's relative pose — and hence its warp residual — is invariant to the
+            # upstream correction, so re-warp ONLY the changed interfaces and reuse the rest
+            # from the first pass. (The blanket re-pass over all interfaces was the bulk of
+            # the Monopoles 2x: 2 interfaces rescued, all 10 re-warped.)
+            changed = sorted({r[0] for r in rescues} | {g[0] for g in scale_gates})
+            new_ifaces = list(base.interfaces)
+            for j, k in enumerate(changed):
+                if progress is not None:
+                    progress("rescue-warp", j, len(changed))
+                one = register_warps_to_coarse(
+                    coords_list[k:k + 2], coarse_poses[k:k + 2],
+                    **warp_kw, **match_kwargs,
+                )
+                if one.interfaces:
+                    new_ifaces[k] = one.interfaces[0]
+            base = StitchResult(
+                poses=[dict(p) for p in coarse_poses],
+                interfaces=new_ifaces,
+                accepted=all(r.qc.accepted for r in new_ifaces),
             )
         rels = [
             compose_poses(invert_pose(coarse_poses[k]), coarse_poses[k + 1])

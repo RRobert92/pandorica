@@ -5,6 +5,40 @@ All notable changes to pandorica are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] — 2026-06-07
+
+Cleanup, performance, and documentation pass on top of the 1.4.0 alignment work —
+no behaviour change, every output numerically identical.
+
+### Changed
+
+- **Faster warp phase on stacks that trip the rescue / scale-gate.** When an interface
+  was rescued or scale-gated, the fine-warp stage re-ran `register_warps_to_coarse` over
+  **every** interface — but only the corrected ones change (an interface's relative pose,
+  hence its warp residual, is invariant to the upstream correction). It now re-warps
+  **only the changed interfaces** and reuses the rest from the first pass. Separately,
+  `gate_coarse_scale` recomputed each interface's full-pose match the first pass already
+  had; it now reuses it (`full_match_fractions`), recomputing only a rescued interface's.
+  On a real 11-section stack (Mac/MPS) the warp phase dropped **463.6 s → 332.0 s
+  (−28 %)** — the second pass touched 2 interfaces instead of 10 — with bit-identical
+  warps (new slice==full-pass and reuse==recompute tests assert it).
+
+### Removed
+
+- **Research scaffolding stripped from production comments.** Removed pointers to `tmp/`
+  probe scripts, `DISCOVERIES.md`, and "reverted mistake" lab-notes from `image_pose.py`,
+  `contour_rotation.py`, and `core.py` (the design rationale they annotated is kept), plus
+  one unused import.
+
+### Documentation
+
+- Reframed the main README, `stitch/README.md`, and `HOW_IT_WORKS.md` around the current
+  **image-driven coarse→fine** default (the image fixes the global pose including the
+  anisotropic stretch; MTs drive only the fine warp) instead of the old "MT-driven with
+  image fallback" framing. Documented the MT rotation **rescue** + anisotropy recovery,
+  the **chain/warp decouple**, the tangent-continuity term, the near-vertical jog cut, and
+  the napari **Warp / Match Inspector** + `--save-inspect` bundle.
+
 ## [1.4.0] — 2026-06-07
 
 ### Added

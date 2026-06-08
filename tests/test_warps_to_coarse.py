@@ -233,6 +233,60 @@ def test_stitch_sections_runs_rescue_path_clean():
     _poses_match(res.poses, gt)
 
 
+def test_single_interface_slice_matches_full_pass():
+    # The incremental re-warp reuses pass-1 interfaces and recomputes ONLY the
+    # rescued/gated ones from a 2-section SLICE. That reuse is correct only if a slice
+    # reproduces the full pass's interface for the same index — assert the invariant.
+    gt = _coarse_chain(4)
+
+    def field(glob):
+        return 5.0 * np.column_stack(
+            [np.sin(glob[:, 1] / 40.0), np.cos(glob[:, 0] / 40.0)]
+        )
+
+    coords = _stack(gt, m=20, seed=2, residual=field)
+    full = core.register_warps_to_coarse(coords, gt)
+
+    for k in range(len(gt) - 1):
+        sliced = core.register_warps_to_coarse(coords[k:k + 2], gt[k:k + 2])
+        assert len(sliced.interfaces) == 1
+        fi, si = full.interfaces[k], sliced.interfaces[0]
+        assert si.warp.accepted == fi.warp.accepted
+        assert {(int(a), int(b)) for a, b, _ in si.id_pairs} == \
+               {(int(a), int(b)) for a, b, _ in fi.id_pairs}
+        pts = _ref_xy(coords[k])
+        np.testing.assert_allclose(
+            si.warp.displacement(pts), fi.warp.displacement(pts), atol=1e-9
+        )
+
+
+def test_incremental_rewarp_equals_full_repass_after_correction():
+    # Drive stitch_sections through a real scale-gate/rescue correction so the
+    # incremental re-warp block runs, then assert the spliced interfaces equal a FULL
+    # re-warp over the final corrected chain (the pre-optimization behavior), field for
+    # field — so reusing the unchanged interfaces from pass 1 changed nothing.
+    gt = _coarse_chain(4)
+    coords = _stack(gt, m=45, seed=5, spread=(60.0, 60.0))
+    # An overfit anisotropic scale on section 2, far-centered, that the MTs reject.
+    R, t = linear_part(gt[2]), np.array([gt[2]["Tx"], gt[2]["Ty"]])
+    S, c0 = np.diag([1.16, 0.97]), np.array([5000.0, 0.0])
+    bad2 = pose_from_matrix(R @ S, R @ ((np.eye(2) - S) @ c0) + t)
+    bad = [dict(gt[0]), dict(gt[1]), bad2, dict(gt[3])]
+
+    res = stitch_sections(coords, coarse_poses=bad)
+    assert res.scale_gates or res.rescues        # a correction fired -> incremental block ran
+
+    full = core.register_warps_to_coarse(coords, res.poses)
+    assert len(full.interfaces) == len(res.base.interfaces)
+    g = np.linspace(-50, 50, 12)
+    XY = np.column_stack([np.repeat(g, 12), np.tile(g, 12)])
+    for fi, si in zip(full.interfaces, res.base.interfaces):
+        assert si.warp.accepted == fi.warp.accepted
+        np.testing.assert_allclose(
+            si.warp.displacement(XY), fi.warp.displacement(XY), atol=1e-4
+        )
+
+
 # --------------------------------------------------------------------------- #
 # scale-gate: drop an overfit image scale the MTs reject (rotation-only matches better)
 # --------------------------------------------------------------------------- #
@@ -270,6 +324,28 @@ def test_scale_gate_keeps_a_genuine_aniso():
 
     assert gated == []                                     # genuine aniso kept
     _poses_match(new_poses, gt)                            # poses untouched
+
+
+def test_gate_scale_reuse_matches_recompute():
+    # Threading the first-pass full-pose match into the gate (so it isn't re-registered)
+    # must give the IDENTICAL decision as recomputing it: same gated set, same chain.
+    gt = _coarse_chain(2)
+    coords = _stack(gt, m=45, seed=5, spread=(60.0, 60.0))
+    R, t = linear_part(gt[1]), np.array([gt[1]["Tx"], gt[1]["Ty"]])
+    S, c0 = np.diag([1.16, 0.97]), np.array([5000.0, 0.0])
+    bad = [dict(gt[0]), pose_from_matrix(R @ S, R @ ((np.eye(2) - S) @ c0) + t)]
+
+    first = core.register_warps_to_coarse(coords, bad)
+    mf = [it.confidence.get("match_fraction") for it in first.interfaces]
+
+    p_recompute, g_recompute = core.gate_coarse_scale(coords, [dict(p) for p in bad])
+    p_reuse, g_reuse = core.gate_coarse_scale(
+        coords, [dict(p) for p in bad], full_match_fractions=mf
+    )
+
+    assert g_recompute                                     # the gate actually fired here
+    assert [x[0] for x in g_reuse] == [x[0] for x in g_recompute]   # same gated interfaces
+    _poses_match(p_reuse, p_recompute)                     # same corrected chain
 
 
 def test_fit_affine_2d_recovers_known_affine():

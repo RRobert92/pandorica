@@ -163,6 +163,7 @@ def run_stitch(
     allow_scale: bool = False,
     lambda_scale: float = 1.0,
     save_inspect: bool = False,
+    dev: bool = False,
     log=print,
 ) -> dict:
     """
@@ -220,6 +221,10 @@ def run_stitch(
         bundle of MT matches + warp field + ``|curl|`` + QC, for the napari
         ``WarpMatchInspectorWidget`` to overlay (inspect which matches / warp
         regions misbehave without re-running the stitch). Default ``False``.
+    :param dev: stream the full per-interface internals, the dense QC table, the
+        per-section pose matrices, and the per-stage timing to the terminal (for
+        debugging). Default ``False`` prints a clean, legible summary instead; the
+        full detail is **always** written to ``stitch_log.txt`` either way.
     :param log: line logger (default ``print``); receives each report line.
     :return: dict with output paths and a timing/settings report.
     """
@@ -252,6 +257,7 @@ def run_stitch(
         f"mt_pad_frac    : {mt_pad_frac}",
         f"workers        : {workers}",
         f"save_inspect   : {save_inspect}",
+        f"dev            : {dev}",
         "",
     ]
     for line in report:
@@ -260,6 +266,48 @@ def run_stitch(
     def _say(msg):
         report.append(msg)
         log(msg)
+
+    def _dev(msg):
+        # Full detail: always recorded to stitch_log.txt; echoed to the terminal only
+        # under --dev, so the default view stays clean.
+        report.append(msg)
+        if dev:
+            log(msg)
+
+    def _clean(msg):
+        # A legible terminal-only line for the default view (the file keeps the fuller
+        # _dev line instead). Suppressed under --dev, where the full line shows.
+        if not dev:
+            log(msg)
+
+    def _coarse_clean(info):
+        # One readable line per interface in the default view; the full "[image-pose] …"
+        # line is recorded via _dev / the log file.
+        lbl = info["label"].replace("->", " → ")
+        sh = info["shift"]
+        bits = [f"rotate {info['rot']:+.1f}°",
+                f"shift {abs(sh[0]):.0f}×{abs(sh[1]):.0f} px"]
+        if info.get("aniso_committed"):
+            bits.append(f"stretch {info['sx']:.2f}×{info['sy']:.2f}")
+        line = f"  {lbl}   {', '.join(bits)}   ({info['agree']:.0%} agree)"
+        if info.get("flagged") or not info.get("trans_ok", True):
+            line += "   — REVIEW (verify visually)"
+        _clean(line)
+
+    def _joint_status(row):
+        # One readable status line per joint in the default view (replaces the dense
+        # coarse/rel/match/warp/QC table, which goes to _dev / the log file).
+        lbl = row["interface"].replace("->", " → ").strip()
+        m = f"{row['match_frac'] * 100:.0f}% matched"
+        if not row["chained"]:
+            _clean(f"  REVIEW  {lbl}   not connected · {m}"
+                   + (f" · {row['reasons']}" if row["reasons"] else ""))
+        elif row["intensity_ok"] is False:
+            _clean(f"  REVIEW  {lbl}   connected · {m} · rotation needs a visual check")
+        elif not row["warp_ok"]:
+            _clean(f"  {lbl}   connected · {m} · warp too twisty — kept coarse alignment")
+        else:
+            _clean(f"  {lbl}   connected · {m} · warp applied")
 
     # --- load -------------------------------------------------------------- #
     t = time.perf_counter()
@@ -313,7 +361,9 @@ def run_stitch(
     if use_mt:
 
         def _solve_progress(phase, k, ntot):
-            _say(f"  [{phase}] interface {k + 1}/{ntot}")
+            _dev(f"  [{phase}] interface {k + 1}/{ntot}")
+            verb = "re-aligning" if phase == "rescue-warp" else "aligning"
+            _clean(f"  {verb} {ds.interface_label(k).replace('->', ' → ')}  ({k + 1}/{ntot})")
 
         if has_vol:
             # COARSE -> FINE (default): the image fixes the global pose — translation,
@@ -328,14 +378,14 @@ def run_stitch(
                 "--- Coarse poses from image (rotation + shift + anisotropic scale; "
                 "applied to MTs) ---"
             )
-            _say(
+            _dev(
                 "    NOTE: the inter-section ROTATION is image-derived; the MT match "
                 "fraction below validates it (a wrong rotation collapses the match)."
             )
             _tc = time.perf_counter()
             coarse_poses = image_only_poses(
                 ds, metric=method if method != "mi" else "ncc",
-                workers=workers, log=_say,
+                workers=workers, log=_dev, on_interface=_coarse_clean,
             )
             t_coarse = time.perf_counter() - _tc
             _say("")
@@ -376,14 +426,12 @@ def run_stitch(
         # is still safe to CONNECT. The volume already falls back to coarse for the
         # rejected warp, and the downstream orient/split cuts any bad individual joints.
         chain_accepted = [bool(iface.qc.chainable) for iface in result.base.interfaces]
-        _say(
-            "--- Per-interface (coarse / rel / match / warp / QC / coarse-flag / intensity) ---"
-        )
+        _say("--- Joints ---")
         rows = stitch.interface_rows(result, ds)
         for row in rows:
             iv = row["intensity_ok"]
             iv_s = "n/a" if iv is None else ("ok" if iv else "FAIL")
-            _say(
+            _dev(
                 f"  {row['interface']:>16}: coarse={row['coarse_deg']:+7.1f}°  "
                 f"rel={row['relative_deg']:+7.2f}°  match={row['match_frac'] * 100:4.0f}%"
                 f"  warp_ok={row['warp_ok']!s:5}  qc_ok={row['qc_ok']!s:5}"
@@ -393,6 +441,7 @@ def run_stitch(
                 + ("  [warp flagged but MTs chained]"
                    if row["chained"] and not row["qc_ok"] else "")
             )
+            _joint_status(row)
         _say(f"  overall accepted: {result.accepted}")
         # Decompose the accept gate so a False is explained, not just reported.
         # accepted = base.accepted AND no coarse-flagged interface AND every
@@ -466,18 +515,19 @@ def run_stitch(
         _say("--- Image-only coarse poses (weighted-RANSAC rigid: rotation + shift) ---")
         _ts = time.perf_counter()
         poses = image_only_poses(
-            ds, metric=method if method != "mi" else "ncc", workers=workers, log=_say
+            ds, metric=method if method != "mi" else "ncc", workers=workers,
+            log=_dev, on_interface=_coarse_clean,
         )
         t_solve = time.perf_counter() - _ts
         mt_warps = None
         chain_pairs = None
         chain_accepted = None
     t_stitch = time.perf_counter() - t
-    _say("")
-    _say("--- Global per-section poses (section 0 = gauge) ---")
+    _dev("")
+    _dev("--- Global per-section poses (section 0 = gauge) ---")
     for name, p in zip(ds.names, poses):
-        _say(f"  {name:>16}: {_fmt_pose(p)}")
-    _say("")
+        _dev(f"  {name:>16}: {_fmt_pose(p)}")
+    _dev("")
 
     # --- image-fill (MT-free regions; also the fine warp for image-only) --- #
     image_warps = None
@@ -584,19 +634,20 @@ def run_stitch(
         _say(f"  {k:>8}: {v}")
     _say("")
     _say("--- Compute time ---")
-    _say(f"  load          : {t_load:7.1f} s")
-    _say(f"  register      : {t_stitch:7.1f} s")
+    _dev(f"  load          : {t_load:7.1f} s")
+    _dev(f"  register      : {t_stitch:7.1f} s")
     if use_mt:
         if has_vol:
-            _say(f"    img-coarse  : {t_coarse:7.1f} s")
-            _say(f"    mt-warp     : {t_solve:7.1f} s")
+            _dev(f"    img-coarse  : {t_coarse:7.1f} s")
+            _dev(f"    mt-warp     : {t_solve:7.1f} s")
         else:
-            _say(f"    mt-solve    : {t_solve:7.1f} s")
+            _dev(f"    mt-solve    : {t_solve:7.1f} s")
     else:
-        _say(f"    image-pose  : {t_solve:7.1f} s")
-    _say(f"  image-fill    : {t_fill:7.1f} s")
-    _say(f"  export/warp   : {t_export:7.1f} s")
-    _say(f"  TOTAL         : {total:7.1f} s")
+        _dev(f"    image-pose  : {t_solve:7.1f} s")
+    _dev(f"  image-fill    : {t_fill:7.1f} s")
+    _dev(f"  export/warp   : {t_export:7.1f} s")
+    _dev(f"  TOTAL         : {total:7.1f} s")
+    _clean(f"  total time: {int(total // 60)}m {int(total % 60):02d}s")
 
     log_path = join(out, "stitch_log.txt")
     with open(log_path, "w") as f:

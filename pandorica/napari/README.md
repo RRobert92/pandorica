@@ -5,7 +5,7 @@ real `.am` datasets, and to **record coarse-alignment ground truth** by hand.
 
 Runs in any conda env with napari installed.
 
-## Two widgets
+## Three widgets
 
 ### Serial Section Stitcher
 1. **Browse folder** → a directory of section `.am` images + `*_spatialGraph.am`
@@ -37,6 +37,21 @@ Runs in any conda env with napari installed.
   data). Device order: CUDA → MPS → CPU.
 - *Match workers* — CPU processes for the image-fill matching (memory-safe: workers
   see only the small downsampled faces). ~2–3× on the slow `mi` metric.
+
+### Warp / Match Inspector
+Loads a `stitch_inspect.npz` written by the CLI's `--save-inspect` flag (or the
+export box) and overlays, **per interface**, what the stitch actually did — without
+re-running the slow registration:
+- **match lines** (`add_shapes`) — each matched MT stub pair drawn from its
+  reference endpoint to its posed+warped moving endpoint; a long line = a large
+  residual misalignment at that spot.
+- **|curl| heatmap** (`add_image`) — the local swirl of the fine warp field, so you
+  can see where the bend worked hard (or was rejected).
+- **warp quiver** (`add_vectors`) — the residual displacement field as arrows.
+
+Step through joints with the **interface scrubber**; the panel shows that joint's QC
+(match fraction, warp accepted, *chainable*). Everything is in the graph-output Å
+frame, so it overlays the exported `stitched_spatialGraph.am` directly.
 
 ### Coarse GT Recorder
 Step through each interface *n→n+1*: the **fixed** top-face endpoints of *n* (blue)
