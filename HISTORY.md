@@ -5,10 +5,18 @@ All notable changes to pandorica are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.5.0] — 2026-06-07
+## [1.5.0] — 2026-06-09
 
-Cleanup, performance, and documentation pass on top of the 1.4.0 alignment work —
-no behaviour change, every output numerically identical.
+Cleanup, performance, documentation, and CLI-logging pass on top of the 1.4.0 alignment
+work — the stitched output is numerically identical; the terminal logging is cleaner.
+
+### Added
+
+- **`--dev` flag for clean CLI logging.** The default terminal output is now a legible,
+  stage-by-stage summary (coarse pose per interface, one status line per joint, a friendly
+  total); `--dev` restores the full dense detail (per-interface internals, the QC table,
+  per-section pose matrices, the timing breakdown). `stitch_log.txt` always keeps the full
+  detail regardless of the flag; the banner + reproducible Settings block are unchanged.
 
 ### Changed
 
